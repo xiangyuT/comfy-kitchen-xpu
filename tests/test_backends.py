@@ -1,3 +1,6 @@
+import subprocess
+import sys
+
 import pytest
 import torch
 
@@ -18,6 +21,7 @@ class TestBackendSystem:
         assert isinstance(backends, dict)
         assert "eager" in backends
         assert "cuda" in backends
+        assert "xpu" in backends
         assert "triton" in backends
 
         # Eager backend should always be available
@@ -27,8 +31,23 @@ class TestBackendSystem:
     def test_backend_priority(self):
         import comfy_kitchen as ck
 
-        ck.set_backend_priority(["eager", "cuda", "triton"])
-        ck.set_backend_priority(["cuda", "triton", "eager"])
+        original = list(ck.registry._priority)
+        try:
+            ck.set_backend_priority(["eager", "cuda", "xpu", "triton"])
+            ck.set_backend_priority(["cuda", "xpu", "triton", "eager"])
+        finally:
+            ck.set_backend_priority(original)
+
+    def test_disable_enable_xpu_backend(self):
+        status = ck.list_backends()["xpu"]
+        if not status["available"]:
+            pytest.skip("XPU backend unavailable")
+        ck.disable_backend("xpu")
+        try:
+            assert ck.list_backends()["xpu"]["disabled"] is True
+        finally:
+            ck.enable_backend("xpu")
+        assert ck.list_backends()["xpu"]["disabled"] is False
 
     def test_disable_enable_backend(self):
         import comfy_kitchen as ck
@@ -46,6 +65,7 @@ class TestBackendSystem:
     def test_int8_capabilities_listed(self):
         """Test that int8 operations are listed in backend capabilities."""
         import comfy_kitchen as ck
+
         backends = ck.list_backends()
 
         # Check eager
@@ -59,6 +79,60 @@ class TestBackendSystem:
         if backends["cuda"]["available"]:
             cuda_caps = backends["cuda"]["capabilities"]
             assert "int8_linear" in cuda_caps
+
+        if backends["xpu"]["available"]:
+            from comfy_kitchen.backends import xpu
+
+            xpu_caps = backends["xpu"]["capabilities"]
+            assert "int8_linear" in xpu_caps
+            assert "mm_int8" in xpu_caps
+            assert "quantize_int8_tensorwise" in xpu_caps
+            if xpu._SVDQ_AVAILABLE:
+                assert "quantize_svdquant_w4a4" in xpu_caps
+                assert "scaled_mm_svdquant_w4a4" in xpu_caps
+            if xpu._NORM_AVAILABLE:
+                assert "adaln" in xpu_caps
+
+    def test_xpu_backend_is_optional(self):
+        """Missing XPU hardware or omni extension must not break package import."""
+        backends = ck.list_backends()
+        status = backends["xpu"]
+
+        assert isinstance(status["available"], bool)
+        if not status["available"]:
+            assert status["unavailable_reason"]
+
+    def test_missing_omni_does_not_break_clean_import(self):
+        script = """
+import sys
+sys.modules['omni_xpu_kernel'] = None
+import comfy_kitchen as ck
+status = ck.list_backends()['xpu']
+assert status['available'] is False
+assert status['unavailable_reason']
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_xpu_constraints_are_device_specific(self):
+        from comfy_kitchen.backends.xpu import _build_constraints
+
+        constraints = _build_constraints()
+        assert constraints["int8_linear"].default_devices == frozenset({"xpu"})
+        assert constraints["mm_int8"].default_devices == frozenset({"xpu"})
+
+    def test_available_xpu_backend_has_native_core(self):
+        from comfy_kitchen.backends import xpu
+
+        if not ck.list_backends()["xpu"]["available"]:
+            pytest.skip("omni XPU backend is unavailable")
+
+        assert xpu._NATIVE_CAPABILITIES == xpu._REQUIRED_NATIVE_INT8_OPS
 
     def test_backend_context_manager_override(self, small_tensor):
         """Test that use_backend context manager correctly overrides backend selection."""
@@ -78,8 +152,10 @@ class TestBackendExceptions:
 
     def test_backend_not_found_error_unregistered(self):
         """Test BackendNotFoundError when requesting unregistered backend."""
-        with pytest.raises(BackendNotFoundError, match="not_a_real_backend"), \
-             ck.use_backend("not_a_real_backend"):
+        with (
+            pytest.raises(BackendNotFoundError, match="not_a_real_backend"),
+            ck.use_backend("not_a_real_backend"),
+        ):
             pass
 
     def test_backend_not_found_error_disabled(self):
@@ -87,8 +163,7 @@ class TestBackendExceptions:
         # Disable eager backend temporarily
         ck.disable_backend("eager")
         try:
-            with pytest.raises(BackendNotFoundError, match="disabled"), \
-                 ck.use_backend("eager"):
+            with pytest.raises(BackendNotFoundError, match="disabled"), ck.use_backend("eager"):
                 pass
         finally:
             # Re-enable for other tests
