@@ -1,0 +1,76 @@
+name: Build Kitchen Omni XPU wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: llm-scaler git ref containing the Kitchen kernel APIs
+        required: true
+        default: main
+      cutlass_sycl_ref:
+        description: Pinned intel/sycl-tla revision used to build cute FMHA
+        required: true
+        default: 27bb6550ccacbd72ab50be9a2c083100ff1d3188
+      torch_spec:
+        description: PyTorch XPU requirement
+        required: true
+        default: torch==2.10.0+xpu
+      device:
+        description: oneAPI AOT target
+        required: true
+        default: bmg
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Python ${{ matrix.python }} / ${{ inputs.device }}
+    runs-on: [self-hosted, xpu, bmg]
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - name: Checkout Comfy Kitchen
+        uses: actions/checkout@v4
+
+      - name: Checkout omni_xpu_kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: intel/llm-scaler
+          ref: ${{ inputs.kernel_ref }}
+          path: llm-scaler
+
+      - name: Checkout CUTLASS-SYCL headers
+        uses: actions/checkout@v4
+        with:
+          repository: intel/sycl-tla
+          ref: ${{ inputs.cutlass_sycl_ref }}
+          path: sycl-tla
+
+      - name: Verify build tools and XPU
+        shell: bash
+        run: |
+          command -v uv
+          command -v icpx
+          uv --version
+
+      - name: Build and test companion wheel
+        shell: bash
+        env:
+          OMNI_XPU_KERNEL_SOURCE: ${{ github.workspace }}/llm-scaler/omni/omni_xpu_kernel
+          CUTLASS_SYCL_ROOT: ${{ github.workspace }}/sycl-tla
+          OMNI_XPU_DEVICE: ${{ inputs.device }}
+          TORCH_SPEC: ${{ inputs.torch_spec }}
+          WHEELHOUSE: ${{ github.workspace }}/wheelhouse/omni_xpu_kernel
+        run: ./packaging/omni_xpu_kernel/build_uv_wheel_matrix.sh "${{ matrix.python }}"
+
+      - name: Upload Kitchen XPU companion wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: comfy-kitchen-omni-xpu-${{ inputs.device }}-py${{ matrix.python }}
+          path: wheelhouse/omni_xpu_kernel/*.whl
+          if-no-files-found: error
