@@ -122,6 +122,16 @@ class QuantizedLayout(ABC):
         return {}
 
     @classmethod
+    def normalize_device_storage(
+        cls,
+        qdata: torch.Tensor,
+        params: Any,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, Any]:
+        """Normalize backend-specific runtime storage after a device move."""
+        return qdata, params
+
+    @classmethod
     def supports_fast_matmul(cls) -> bool:
         """Check if fast quantized matmul is supported on current hardware."""
         if cls.MIN_SM_VERSION is None:
@@ -426,6 +436,9 @@ def _handle_to(qt, args, kwargs, force_copy=False):
     if needs_device:
         new_qdata = qt._qdata.to(device=target_device)
         new_params = qt._params.to_device(target_device)
+        new_qdata, new_params = qt.layout_cls.normalize_device_storage(
+            new_qdata, new_params, target_device
+        )
     else:
         new_qdata = qt._qdata.clone() if force_copy else qt._qdata
         new_params = qt._params.clone()
