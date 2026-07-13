@@ -5,8 +5,8 @@ from .backends import cuda as _cuda_backend  # noqa: F401
 # Import backends to trigger auto-registration
 from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
+from .backends import xpu as _xpu_backend  # noqa: F401
 from .backends.eager.quantization import DTYPE_TO_CODE
-from .backends.eager.quantization import mm_int8 as _mm_int8
 from .exceptions import (
     BackendError,
     BackendNotFoundError,
@@ -522,7 +522,9 @@ def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
 
 def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N]."""
-    return _mm_int8(a, b)
+    kwargs = {"a": a, "b": b}
+    impl = registry.get_implementation("mm_int8", kwargs=kwargs)
+    return impl(**kwargs)
 
 
 def int8_linear(
@@ -550,17 +552,16 @@ def int8_linear(
     """
     if out_dtype is None:
         out_dtype = torch.bfloat16
-    kwargs = {
-        "x": x,
-        "weight": weight,
-        "weight_scale": weight_scale,
-        "bias": bias,
-        "out_dtype": out_dtype,
-        "convrot": convrot,
-        "convrot_groupsize": convrot_groupsize,
-    }
-    impl = registry.get_implementation("int8_linear", kwargs=kwargs)
-    return impl(**kwargs)
+    dtype_code = DTYPE_TO_CODE[out_dtype]
+    return torch.ops.comfy_kitchen.int8_linear(
+        x,
+        weight,
+        weight_scale,
+        bias,
+        dtype_code,
+        convrot,
+        convrot_groupsize,
+    )
 
 
 # =============================================================================
