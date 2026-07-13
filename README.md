@@ -2,20 +2,35 @@
 
 Fast kernel library for Diffusion inference with multiple compute backends.
 
+Intel XPU support is available experimentally through the optional
+[`omni_xpu_kernel`](https://github.com/intel/llm-scaler/tree/main/omni/omni_xpu_kernel)
+package. Excluding the explicitly deferred NVFP4, MXFP8, and AWQ formats, the
+XPU backend covers all 24 eager API capabilities.
+The detailed implementation and validation record is maintained in
+[`docs/XPU_BACKEND_STATUS.md`](docs/XPU_BACKEND_STATUS.md).
+
 ## Backend Capabilities Matrix
 
-| Function                    | eager | cuda | triton |
-|-----------------------------|-------|------|--------|
-| `quantize_per_tensor_fp8`   | ✓     | ✓    | ✓      |
-| `dequantize_per_tensor_fp8` | ✓     | ✓    | ✓      |
-| `quantize_nvfp4`            | ✓     | ✓    | ✓      |
-| `dequantize_nvfp4`          | ✓     | ✓    |        |
-| `scaled_mm_nvfp4`           | ✓     | ✓    |        |
-| `quantize_mxfp8`            | ✓     | ✓    | ✓      |
-| `dequantize_mxfp8`          | ✓     |      |        |
-| `scaled_mm_mxfp8`           | ✓     |      |        |
-| `apply_rope`                | ✓     | ✓    | ✓      |
-| `apply_rope1`               | ✓     | ✓    | ✓      |
+| Function                    | eager | cuda | xpu | triton |
+|-----------------------------|-------|------|-----|--------|
+| `quantize_per_tensor_fp8`   | ✓     | ✓    | ✓   | ✓      |
+| `dequantize_per_tensor_fp8` | ✓     | ✓    | ✓   | ✓      |
+| `quantize_nvfp4`            | ✓     | ✓    |     | ✓      |
+| `dequantize_nvfp4`          | ✓     | ✓    |     |        |
+| `scaled_mm_nvfp4`           | ✓     | ✓    |     |        |
+| `quantize_mxfp8`            | ✓     | ✓    |     | ✓      |
+| `dequantize_mxfp8`          | ✓     |      |     |        |
+| `scaled_mm_mxfp8`           | ✓     |      |     |        |
+| `quantize_int8_tensorwise`  | ✓     | ✓    | ✓   |        |
+| `quantize_int8_rowwise`     | ✓     | ✓    | ✓   | ✓      |
+| `dequantize_int8_simple`    | ✓     | ✓    | ✓   |        |
+| `int8_linear`               | ✓     | ✓    | ✓   | ✓      |
+| `mm_int8`                   | ✓     |      | ✓   |        |
+| `quantize_svdquant_w4a4`    | ✓     | ✓    | ✓   |        |
+| `scaled_mm_svdquant_w4a4`   | ✓     | ✓    | ✓   |        |
+| `adaln`                     | ✓     | ✓    | ✓   | ✓      |
+| `apply_rope`                | ✓     | ✓    | ✓   | ✓      |
+| `apply_rope1`               | ✓     | ✓    | ✓   | ✓      |
 
 
 ## Quantized Tensors
@@ -74,6 +89,72 @@ pip install -e ".[dev]"
 # For faster rebuilds during development (skip build isolation)
 pip install -e . --no-build-isolation -v
 ```
+
+### Intel XPU (experimental)
+
+Install a PyTorch build with XPU support and build/install `omni_xpu_kernel`
+for the target GPU first. Comfy Kitchen discovers it at import time:
+
+```bash
+git clone https://github.com/intel/llm-scaler.git
+OMNI_XPU_REQUIRE_CUTE=0 OMNI_XPU_DEVICE=bmg \
+    pip install ./llm-scaler/omni/omni_xpu_kernel --no-build-isolation
+pip install comfy-kitchen
+```
+
+Use `OMNI_XPU_DEVICE=pvc` for Intel Data Center GPU Max. If the package, native
+extension, or XPU device is unavailable, the backend is reported as unavailable
+by `list_backends()` and normal eager/CUDA/Triton behavior is unchanged.
+
+The direct install above explicitly selects a core-only build, which is
+sufficient for Kitchen's operator backend but omits the CUTE attention
+sidecar. CUTE is required by default for normal Linux builds. Kitchen's
+companion release wheel supplies `CUTLASS_SYCL_ROOT` and keeps the explicit
+`OMNI_XPU_REQUIRE_CUTE=1` release guard; see
+[`packaging/omni_xpu_kernel/README.md`](packaging/omni_xpu_kernel/README.md) for
+the Python-version matrix, artifact location, and clean-install acceptance
+checks.
+
+The backend negotiates optional native symbol groups before registering each
+capability. The companion omni implementation includes INT8 ConvRot, complete
+arbitrary-2x2 RoPE semantics (adjacent and split-half), FP8 Q/DQ/stochastic
+rounding, and ConvRot W4A4.
+
+The signed SVDQuant path uses omni's ESIMD activation quantize/dequantize and
+oneDNN INT4 weight GEMM. Kitchen tile-packed checkpoints can be converted once
+at load time with `comfy_kitchen.backends.xpu.svdquant.prepare_svdquant_weights`.
+The unsigned `act_unsigned=True` path uses dedicated ESIMD U4 quantization and
+dequantization.
+
+For repeated SVDQuant inference, weights can be destructively converted to
+oneDNN's preconverted representation without retaining a second INT4 copy:
+
+```python
+from comfy_kitchen.tensor import prepare_svdquant_for_xpu
+
+weight = prepare_svdquant_for_xpu(weight)  # natural layout: qdata converted in place
+weight = weight.to("xpu")                  # prepare tile-packed weights on CPU first
+```
+
+The packed weight allocation and total persistent qdata+scale byte count remain
+unchanged. For a natural 3840x3840 layer, measured peak conversion overhead is
+only the 0.46 MB scale replacement rather than the 7.37 MB INT4 weight. Calling
+`state_dict()` returns standard signed Kitchen tensors; in especially
+memory-constrained saving code, call `restore_svdquant_standard_format_(weight)`
+first to restore qdata in place and avoid the temporary serialized INT4 tensor.
+
+AdaLN fuses LayerNorm and Kitchen modulation in one ESIMD kernel for hidden
+dimensions divisible by 32 and no larger than 8192 and common broadcast
+layouts. Other valid shapes and broadcasts use the safe composed path.
+
+`TensorCoreFP8Layout` also uses omni's oneDNN W8A16 path when a floating-point
+XPU activation is multiplied by an FP8 weight. Kitchen's scalar scale is
+expanded to omni's per-output-channel scale ABI. Unsupported oneDNN shapes fall
+back to normal dequantized linear execution. For `(M,K,N)=(64,3840,3840)`, this
+avoided per-call weight dequantization was about 12.9x faster in a local BMG
+microbenchmark; compared with an already materialized BF16 weight, W8A16 itself
+was slightly slower, so the benefit is primarily memory capacity and avoiding
+repeated dequantization.
 
 #### Build Options
 
@@ -136,11 +217,12 @@ with ck.use_backend("triton"):
 The library supports multiple backends:
 - **eager**: Pure PyTorch implementation
 - **cuda**: Custom CUDA C kernels (CUDA only)
+- **xpu**: Intel XPU kernels supplied by optional `omni_xpu_kernel`
 - **triton**: Triton JIT-compiled kernels
 
 ### Automatic Backend Selection
 
-When you call a function, the registry selects the best backend by checking **constraints** in priority order (`cuda` → `triton` → `eager`):
+When you call a function, the registry selects the best backend by checking **constraints** in priority order (`cuda` → `xpu` → `triton` → `eager`):
 
 ```python
 # Backend is selected automatically based on input constraints
