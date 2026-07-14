@@ -14,6 +14,7 @@ permissions:
 
 jobs:
   cla-assistant:
+    if: github.repository == 'Comfy-Org/comfy-kitchen'
     runs-on: ubuntu-latest
     steps:
       # The CLA action normally requires every commit author in a PR to sign.
