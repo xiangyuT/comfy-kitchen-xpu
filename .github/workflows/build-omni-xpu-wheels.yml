@@ -10,7 +10,7 @@ on:
       cutlass_sycl_ref:
         description: Pinned intel/sycl-tla revision used to build cute FMHA
         required: true
-        default: 27bb6550ccacbd72ab50be9a2c083100ff1d3188
+        default: 525faea3f0f43a8aec2d21a70d44111db639a3a9
       torch_spec:
         description: PyTorch XPU requirement
         required: true

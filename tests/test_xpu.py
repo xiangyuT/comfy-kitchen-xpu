@@ -450,7 +450,7 @@ def test_xpu_convrot_roundtrip_uses_dtype_adapter():
 
 
 @pytest.mark.parametrize("linear_dtype", ["int4", "int8"])
-def test_xpu_convrot_w4a4_layout_linear(linear_dtype):
+def test_xpu_convrot_w4a4_layout_linear(linear_dtype, seed):
     from comfy_kitchen.tensor import QuantizedTensor
 
     x = torch.randn(5, 128, device="xpu", dtype=torch.bfloat16)

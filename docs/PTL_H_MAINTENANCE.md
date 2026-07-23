@@ -16,14 +16,15 @@ The initial PTL-H companion source profile is:
 | Kernel repository | `xiangyuT/llm-scaler` |
 | Kernel development ref | `dev/roofline-kernel-tuning` |
 | Pinned source checkpoint | `dfc364da1f77ea6ea102df13f3177af9b36b4b81` |
+| CUTLASS-SYCL checkpoint | `525faea3f0f43a8aec2d21a70d44111db639a3a9` |
 | PyTorch XPU | `2.11.0+xpu` |
 | AOT target | `ptl-h` |
 | Expected wheel local tag | `+torch211.ptlh` |
+| oneDNN build/runtime | `onednn-devel==2025.3.0` / `onednn==2025.3.0` |
 
-The branch starts with configuration and source/API compatibility checks. A
-previous Kernel result does not by itself accept the Kitchen integration; the
-companion wheel, Kitchen tests, and workflow checks below still have to pass
-from this branch.
+Acceptance belongs to the complete source/wheel/test/workflow tuple. A previous
+Kernel result or a wheel from another target does not by itself accept the
+Kitchen integration.
 
 ## Ownership boundary
 
@@ -80,21 +81,39 @@ fix set is ready for approval.
 
 ## Current state
 
-Branch initialization was validated in the existing approved PTL-H container
-with Torch `2.11.0+xpu`; the installed wheel reported
-`0.1.0b8.dev0+torch211.ptlh`, package target `ptl-h`, and native core AOT target
-`ptl-h`. Kitchen results were:
+The Python 3.12 PTL-H development tuple passed the complete acceptance ladder
+on 2026-07-23. The accepted local artifacts are:
 
-- focused XPU/backend/INT8 selection: 77 passed, 28 skipped, 5 deselected;
-- portable full selection (`-k "not cuda"`): 465 passed, 123 skipped, 207
-  deselected.
+| Artifact | Bytes | SHA-256 |
+|---|---:|---|
+| `omni_xpu_kernel-0.1.0b8.dev0+torch211.ptlh-cp312-cp312-linux_x86_64.whl` | 1812687 | `ac614bbcbe86e651a7c1d913be04878c3d09b5318bd95b3e9c4c842ed6b17b09` |
+| `comfy_kitchen-0.2.18-py3-none-any.whl` | 129011 | `05362811d68a747d32b2a13eff9f3efb63585fc609ea780f7bd24647f92bea70` |
+
+The native artifact was built from a filtered source copy, contained all three
+core/LGRF/CUTE shared objects, contained no Python bytecode, clean-installed
+with pip oneDNN runtime only, had no unresolved ELF dependencies, and passed a
+real CUTE BF16 call. Package target, version tag, loaded core AOT target, and
+Torch minor all matched PTL-H/Torch 2.11.
+
+Acceptance results were:
+
+- Kernel installed-wheel runtime: 544 passed, 2 skipped;
+- Kernel source packaging: 26 passed, including a clean-copy LGRF wheel build;
+- Kitchen focused XPU/backend/INT8/version: 78 passed, 28 skipped, 5 deselected;
+- Kitchen portable full selection (`-k "not cuda"`): 466 passed, 123 skipped,
+  207 deselected;
+- ComfyUI single-process 1024 x 1024 switch: Boogu INT8 -> Krea2 INT8 -> Boogu
+  INT8, three valid RGB outputs, service remained healthy, no Level Zero OOR or
+  OOM, and approximately 40.1 GB XPU memory remained available after the final
+  workflow.
 
 The focused run exposed a deterministic ConvRot row-quantization boundary:
 native FP32 inverse-scale math and eager BF16 scale division can differ by one
 INT8 unit while producing identical row scales. Kitchen now enforces the same
 maximum-one-unit contract as the native Kernel correctness suite.
 
-This is adapter/runtime acceptance against the preinstalled PTL-H artifact,
-not acceptance of a wheel newly built by this branch. A clean companion-wheel
-matrix and workflow acceptance remain pending and must not be inferred from the
-BMG status document or from a different container image.
+The current ComfyUI image declares `comfy-kitchen==0.2.16`; runtime acceptance
+explicitly replaced it with the branch's `0.2.18` pure-Python wheel. Updating
+that image pin and rebuilding the image is the next release phase and still
+requires explicit approval. It is not needed to reproduce the accepted
+container-layer integration above.

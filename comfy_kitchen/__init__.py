@@ -1,5 +1,6 @@
 import torch
 
+from ._version import __version__
 from .backends import cuda as _cuda_backend  # noqa: F401
 
 # Import backends to trigger auto-registration
@@ -23,9 +24,8 @@ from .tensor.convrot_w4a4 import (
     quantize_convrot_w4a4_weight,
 )
 
-__version__ = "0.1.0"
-
 __all__ = [
+    "__version__",
     # Normalization
     "adaln",
     # Quantization / dequantization

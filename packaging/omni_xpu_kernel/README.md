@@ -43,19 +43,33 @@ extensions stay under the llm-scaler Kernel checkout, where they are also
 ignored. Release artifacts are uploaded by
 `.github/workflows/build-omni-xpu-wheels.yml`.
 
+The build venv installs `onednn==2025.3.0` plus matching
+`onednn-devel==2025.3.0` headers. The clean runtime venv deliberately installs
+only `onednn`; the XPU Torch wheel does not declare it, while the omni wheel is
+installed with `--no-deps` to prevent a package index from replacing XPU Torch
+with a generic build.
+
+Compilation runs from a filtered per-Python source copy under `MATRIX_ROOT`.
+Git metadata, old `build`/`dist`/egg-info directories, in-tree shared objects,
+and Python bytecode are excluded so a shared llm-scaler checkout cannot leak
+stale artifacts into a companion wheel. Set `KEEP_BUILD_TREES=1` only when the
+staged source and compiler output are needed for diagnosis.
+
 ## PTL-H development status
 
 The PTL-H profile is maintained on `dev/ptl-h-kitchen-xpu`. Its initial
 llm-scaler source checkpoint is
 `dfc364da1f77ea6ea102df13f3177af9b36b4b81`; the expected wheel identity ends
-in `+torch211.ptlh`. The clean-install smoke test rejects a mismatched Torch
+in `+torch211.ptlh`. CUTLASS-SYCL is pinned to
+`525faea3f0f43a8aec2d21a70d44111db639a3a9`. The clean-install smoke test
+rejects stale bytecode, a mismatched Torch
 minor, package target, version tag, or native core AOT target before exercising
 the required native APIs and CUTE attention.
 
-Branch initialization has static and Kitchen adapter/runtime validation against
-an existing PTL-H artifact. The PTL-H matrix must still be built and run on the
-target runner before a newly produced wheel is accepted. The complete phase
-boundary is in
+The Python 3.12 wheel from the pinned tuple passed filtered-source build,
+clean-install, Kernel/Kitchen tests, and 1024 x 1024 Boogu/Krea2/Boogu ComfyUI
+workflow switching on PTL-H. Python 3.10, 3.11, 3.13, and 3.14 remain matrix
+jobs rather than accepted local artifacts. The complete phase boundary is in
 [`docs/PTL_H_MAINTENANCE.md`](../../docs/PTL_H_MAINTENANCE.md).
 
 ## Historical BMG artifact status
