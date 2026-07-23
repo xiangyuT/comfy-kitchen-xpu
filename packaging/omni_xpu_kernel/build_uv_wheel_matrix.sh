@@ -12,8 +12,28 @@ KITCHEN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OMNI_XPU_KERNEL_SOURCE="${OMNI_XPU_KERNEL_SOURCE:-${KITCHEN_ROOT}/../llm-scaler/omni/omni_xpu_kernel}"
 WHEELHOUSE="${WHEELHOUSE:-${KITCHEN_ROOT}/wheelhouse/omni_xpu_kernel}"
 MATRIX_ROOT="${MATRIX_ROOT:-${OMNI_XPU_KERNEL_SOURCE}/.uv-wheel-matrix}"
-TORCH_SPEC="${TORCH_SPEC:-torch==2.10.0+xpu}"
+TORCH_SPEC="${TORCH_SPEC:-torch==2.11.0+xpu}"
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/xpu}"
+OMNI_XPU_DEVICE="${OMNI_XPU_DEVICE:-ptl-h}"
+EXPECTED_TORCH_MINOR="${EXPECTED_TORCH_MINOR:-2.11}"
+EXPECTED_XPU_TARGET="${EXPECTED_XPU_TARGET:-${OMNI_XPU_DEVICE}}"
+
+case "${OMNI_XPU_DEVICE}" in
+    bmg|ptl-h) ;;
+    *)
+        echo "Unsupported OMNI_XPU_DEVICE: ${OMNI_XPU_DEVICE}; expected bmg or ptl-h" >&2
+        exit 2
+        ;;
+esac
+if [[ "${EXPECTED_XPU_TARGET}" != "${OMNI_XPU_DEVICE}" ]]; then
+    echo "EXPECTED_XPU_TARGET must match OMNI_XPU_DEVICE" >&2
+    exit 2
+fi
+if [[ ! "${EXPECTED_TORCH_MINOR}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    echo "EXPECTED_TORCH_MINOR must be a major.minor pair" >&2
+    exit 2
+fi
+export OMNI_XPU_DEVICE EXPECTED_TORCH_MINOR EXPECTED_XPU_TARGET
 
 if [[ ! -f "${OMNI_XPU_KERNEL_SOURCE}/setup.py" ]]; then
     echo "omni_xpu_kernel source not found: ${OMNI_XPU_KERNEL_SOURCE}" >&2
@@ -102,12 +122,40 @@ for version in "${PYTHON_VERSIONS[@]}"; do
     (
         cd "${MATRIX_ROOT}"
         "${smoke_venv}/bin/python" - <<'PY'
+import os
+
 import torch
 import omni_xpu_kernel
 from omni_xpu_kernel import cute
 
+expected_torch_minor = os.environ["EXPECTED_TORCH_MINOR"]
+expected_xpu_target = os.environ["EXPECTED_XPU_TARGET"]
+torch_public = torch.__version__.split("+", 1)[0]
+torch_minor = ".".join(torch_public.split(".")[:2])
+package_torch_minor = ".".join(omni_xpu_kernel.__torch_version__.split(".")[:2])
+target_tag = expected_xpu_target.replace("-", "")
+torch_tag = expected_torch_minor.replace(".", "")
+
+assert torch_minor == expected_torch_minor, (
+    f"expected Torch {expected_torch_minor}, found {torch.__version__}"
+)
+assert package_torch_minor == expected_torch_minor, (
+    "wheel Torch identity mismatch: "
+    f"{omni_xpu_kernel.__torch_version__} vs {torch.__version__}"
+)
+assert omni_xpu_kernel.__xpu_target__ == expected_xpu_target, (
+    "wheel target mismatch: "
+    f"{omni_xpu_kernel.__xpu_target__} vs {expected_xpu_target}"
+)
+assert omni_xpu_kernel.__version__.endswith(f"+torch{torch_tag}.{target_tag}"), (
+    f"wheel version lacks Torch/target identity: {omni_xpu_kernel.__version__}"
+)
 assert torch.xpu.is_available(), "PyTorch XPU is unavailable"
 assert omni_xpu_kernel.is_available(), "omni native extension is unavailable"
+assert omni_xpu_kernel.core_aot_target() == expected_xpu_target, (
+    "loaded core AOT target mismatch: "
+    f"{omni_xpu_kernel.core_aot_target()} vs {expected_xpu_target}"
+)
 assert cute.is_available(), "cute FMHA extension is unavailable"
 required = {
     "fp8": {"quantize_per_tensor", "dequantize_per_tensor", "stochastic_rounding"},

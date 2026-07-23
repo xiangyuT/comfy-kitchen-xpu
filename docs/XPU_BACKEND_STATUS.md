@@ -4,9 +4,14 @@ Last updated: 2026-07-13
 
 This document records the local implementation status of the experimental
 Intel XPU backend powered by
-[`omni_xpu_kernel`](https://github.com/intel/llm-scaler/tree/main/omni/omni_xpu_kernel).
+[`omni_xpu_kernel`](https://github.com/xiangyuT/llm-scaler/tree/main/omni/omni_xpu_kernel).
 It is intended to make the implementation, constraints, and remaining work
 recoverable without relying on external discussion history.
+
+The measurements below describe the original BMG integration. PTL-H is
+maintained as a target-specific development line; see
+[`PTL_H_MAINTENANCE.md`](PTL_H_MAINTENANCE.md) for its source pin and
+acceptance state. Results are not carried between GPU targets.
 
 ## Source Baseline
 
@@ -410,7 +415,7 @@ model-generating workflow was not run.
 1. Integrate CPU-side destructive SVDQuant preparation into the actual model
    loader so tile-packed weights never reach XPU in their source layout.
 2. Benchmark full ComfyUI workflows rather than isolated kernels.
-3. Add PVC coverage and target-specific wheel testing.
+3. Complete target-specific PTL-H and BMG companion-wheel testing.
 4. Decide whether Kitchen should add public RMSNorm, SDPA, and GGUF APIs.
 5. Replace the portable ConvRot W4A4 INT8-unpack GEMM with a packed XPU INT4
    primitive when oneDNN exposes a suitable signed-W4/quantized-activation ABI.

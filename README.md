@@ -3,11 +3,13 @@
 Fast kernel library for Diffusion inference with multiple compute backends.
 
 Intel XPU support is available experimentally through the optional
-[`omni_xpu_kernel`](https://github.com/intel/llm-scaler/tree/main/omni/omni_xpu_kernel)
+[`omni_xpu_kernel`](https://github.com/xiangyuT/llm-scaler/tree/main/omni/omni_xpu_kernel)
 package. Excluding the explicitly deferred NVFP4, MXFP8, and AWQ formats, the
 XPU backend covers all 24 eager API capabilities.
 The detailed implementation and validation record is maintained in
-[`docs/XPU_BACKEND_STATUS.md`](docs/XPU_BACKEND_STATUS.md).
+[`docs/XPU_BACKEND_STATUS.md`](docs/XPU_BACKEND_STATUS.md). PTL-H branch
+ownership and acceptance state are tracked separately in
+[`docs/PTL_H_MAINTENANCE.md`](docs/PTL_H_MAINTENANCE.md).
 
 ## Backend Capabilities Matrix
 
@@ -93,18 +95,25 @@ pip install -e . --no-build-isolation -v
 ### Intel XPU (experimental)
 
 Install a PyTorch build with XPU support and build/install `omni_xpu_kernel`
-for the target GPU first. Comfy Kitchen discovers it at import time:
+for the target GPU first. The PTL-H development profile uses Torch 2.11 and a
+PTL-H-specific wheel:
 
 ```bash
-git clone https://github.com/intel/llm-scaler.git
-OMNI_XPU_REQUIRE_CUTE=0 OMNI_XPU_DEVICE=bmg \
+git clone https://github.com/xiangyuT/llm-scaler.git
+git -C llm-scaler checkout dfc364da1f77ea6ea102df13f3177af9b36b4b81
+pip install torch==2.11.0+xpu \
+    --index-url https://download.pytorch.org/whl/xpu
+OMNI_XPU_REQUIRE_CUTE=0 OMNI_XPU_DEVICE=ptl-h \
     pip install ./llm-scaler/omni/omni_xpu_kernel --no-build-isolation
 pip install comfy-kitchen
 ```
 
-Use `OMNI_XPU_DEVICE=pvc` for Intel Data Center GPU Max. If the package, native
-extension, or XPU device is unavailable, the backend is reported as unavailable
-by `list_backends()` and normal eager/CUDA/Triton behavior is unchanged.
+The BMG integration remains on `dev/kitchen_xpu` with its own BMG-targeted
+companion artifact. Native wheels are Torch-ABI- and GPU-target-specific; do
+not copy a BMG artifact to PTL-H or publish either as a generic XPU wheel. If
+the package, native extension, or XPU device is unavailable, the backend is
+reported as unavailable by `list_backends()` and normal eager/CUDA/Triton
+behavior is unchanged.
 
 The direct install above explicitly selects a core-only build, which is
 sufficient for Kitchen's operator backend but omits the CUTE attention

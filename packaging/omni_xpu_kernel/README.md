@@ -16,7 +16,8 @@ This separation is intentional:
 
 The default source path expects sibling `comfy-kitchen` and `llm-scaler`
 checkouts. `CUTLASS_SYCL_ROOT` is mandatory because cute FMHA is the default
-ComfyUI-OmniXPU attention backend:
+ComfyUI-OmniXPU attention backend. On `dev/ptl-h-kitchen-xpu`, the script
+defaults to Torch `2.11.0+xpu` and `OMNI_XPU_DEVICE=ptl-h`:
 
 ```bash
 CUTLASS_SYCL_ROOT=/path/to/intel-sycl-tla \
@@ -29,6 +30,10 @@ Override it when the repositories are elsewhere:
 ```bash
 OMNI_XPU_KERNEL_SOURCE=/path/to/llm-scaler/omni/omni_xpu_kernel \
 CUTLASS_SYCL_ROOT=/path/to/intel-sycl-tla \
+OMNI_XPU_DEVICE=ptl-h \
+TORCH_SPEC=torch==2.11.0+xpu \
+EXPECTED_TORCH_MINOR=2.11 \
+EXPECTED_XPU_TARGET=ptl-h \
     ./packaging/omni_xpu_kernel/build_uv_wheel_matrix.sh 3.12
 ```
 
@@ -38,10 +43,27 @@ extensions stay under the llm-scaler Kernel checkout, where they are also
 ignored. Release artifacts are uploaded by
 `.github/workflows/build-omni-xpu-wheels.yml`.
 
-## Current milestone status
+## PTL-H development status
 
-Cute became a required Kitchen artifact on 2026-07-13. The full matrix rebuild
-is intentionally deferred until the project milestone is declared:
+The PTL-H profile is maintained on `dev/ptl-h-kitchen-xpu`. Its initial
+llm-scaler source checkpoint is
+`dfc364da1f77ea6ea102df13f3177af9b36b4b81`; the expected wheel identity ends
+in `+torch211.ptlh`. The clean-install smoke test rejects a mismatched Torch
+minor, package target, version tag, or native core AOT target before exercising
+the required native APIs and CUTE attention.
+
+Branch initialization has static and Kitchen adapter/runtime validation against
+an existing PTL-H artifact. The PTL-H matrix must still be built and run on the
+target runner before a newly produced wheel is accepted. The complete phase
+boundary is in
+[`docs/PTL_H_MAINTENANCE.md`](../../docs/PTL_H_MAINTENANCE.md).
+
+## Historical BMG artifact status
+
+The following table is retained from the original BMG integration. It is not a
+PTL-H artifact list and none of its wheels may be reused for PTL-H. CUTE became
+a required Kitchen artifact on 2026-07-13; that BMG matrix rebuild was deferred
+until its project milestone:
 
 Current llm-scaler source is versioned `0.1.0-b8-dev`; its wheel metadata and
 filename use the PEP 440-normalized `0.1.0b8.dev0`. The artifacts below predate
@@ -62,7 +84,7 @@ required FP8, RoPE, INT8, ConvRot, AdaLN, and unsigned-SVDQuant symbol checks.
 It also verifies that the current cute Kernel rejects cross-attention rather
 than returning an unvalidated result.
 
-Only the accepted cp312 wheel is kept at the top level of
+Only the historically accepted BMG cp312 wheel is kept at the top level of
 `wheelhouse/omni_xpu_kernel/`. Old wheels that predate the cute requirement are
 under `legacy-no-cute/` so release globs cannot select them. Wheel hashes are
 artifact identifiers, not reproducible-build guarantees; rebuilding can

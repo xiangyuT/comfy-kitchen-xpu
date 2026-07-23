@@ -2,6 +2,19 @@ name: Test Intel XPU Backend
 
 on:
   workflow_dispatch:
+    inputs:
+      device:
+        description: Installed omni wheel and runner GPU target
+        required: true
+        default: ptl-h
+        type: choice
+        options:
+          - ptl-h
+          - bmg
+      torch_minor:
+        description: Expected installed PyTorch major.minor
+        required: true
+        default: "2.11"
 
 permissions:
   contents: read
@@ -9,8 +22,8 @@ permissions:
 jobs:
   test_xpu:
     # This workflow is intentionally manual: GitHub-hosted runners do not expose
-    # Intel GPUs. Attach a runner carrying both the `xpu` and `bmg` labels.
-    runs-on: [self-hosted, xpu, bmg]
+    # Intel GPUs. The device label must match the installed wheel's AOT target.
+    runs-on: [self-hosted, xpu, "${{ inputs.device }}"]
     timeout-minutes: 30
 
     steps:
@@ -19,9 +32,34 @@ jobs:
 
       - name: Verify preinstalled XPU runtime
         shell: bash
+        env:
+          EXPECTED_TORCH_MINOR: ${{ inputs.torch_minor }}
+          EXPECTED_XPU_TARGET: ${{ inputs.device }}
         run: |
-          python -c "import torch; assert torch.xpu.is_available(); print(torch.__version__, torch.xpu.get_device_name())"
-          python -c "import omni_xpu_kernel; assert omni_xpu_kernel.is_available(); print(omni_xpu_kernel.__version__)"
+          python - <<'PY'
+          import os
+          import torch
+          import omni_xpu_kernel
+
+          expected_minor = os.environ["EXPECTED_TORCH_MINOR"]
+          expected_target = os.environ["EXPECTED_XPU_TARGET"]
+          torch_minor = ".".join(torch.__version__.split("+", 1)[0].split(".")[:2])
+          package_minor = ".".join(omni_xpu_kernel.__torch_version__.split(".")[:2])
+
+          assert torch.xpu.is_available(), "PyTorch XPU is unavailable"
+          assert omni_xpu_kernel.is_available(), "omni native extension is unavailable"
+          assert torch_minor == expected_minor, (torch.__version__, expected_minor)
+          assert package_minor == expected_minor, (
+              omni_xpu_kernel.__torch_version__, expected_minor
+          )
+          assert omni_xpu_kernel.__xpu_target__ == expected_target
+          assert omni_xpu_kernel.core_aot_target() == expected_target
+          print(
+              torch.__version__,
+              omni_xpu_kernel.__version__,
+              torch.xpu.get_device_name(),
+          )
+          PY
 
       - name: Build pure Python Comfy Kitchen wheel
         shell: bash
