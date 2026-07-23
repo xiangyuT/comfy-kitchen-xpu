@@ -180,22 +180,6 @@ revision/version and XPU target.
 - Full-image measurements include changes outside Kitchen and cannot establish
   an isolated Kitchen speedup.
 
-## Contributing
-
-Please keep upstream-generic changes separate from Intel-specific integration
-where possible. XPU changes should include:
-
-- capability and fallback behavior;
-- target and Torch ABI identity;
-- focused operator correctness;
-- portable non-CUDA regression coverage;
-- at least one representative workflow when runtime behavior changes;
-- separate BMG and PTL-H evidence for claims covering both targets.
-
-Changes that are generally useful to Comfy Kitchen should be proposed to
-[the upstream project](https://github.com/Comfy-Org/comfy-kitchen) whenever
-practical.
-
 ---
 
 ## Upstream README reference
