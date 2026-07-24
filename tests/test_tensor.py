@@ -1,4 +1,5 @@
 """Unit tests for comfy_kitchen.tensor module."""
+
 import pytest
 import torch
 
@@ -14,12 +15,37 @@ from comfy_kitchen.tensor import (
 )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-class TestTensorCoreFP8Layout:
+@pytest.fixture(
+    params=[
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable"),
+        ),
+        pytest.param(
+            "xpu",
+            marks=pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU unavailable"),
+        ),
+    ]
+)
+def accelerator_device(request):
+    return request.param
+
+
+class _PortableAcceleratorTest:
+    @pytest.fixture(autouse=True)
+    def _set_accelerator_device(self, accelerator_device):
+        self.device = accelerator_device
+
+    def require_cuda_format(self):
+        if self.device != "cuda":
+            pytest.skip("NVFP4/MXFP8 coverage is deferred on XPU")
+
+
+class TestTensorCoreFP8Layout(_PortableAcceleratorTest):
     """Tests for FP8 quantization layout."""
 
     def test_quantize_basic(self):
-        x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(128, 256, device=self.device, dtype=torch.bfloat16)
         qdata, params = TensorCoreFP8Layout.quantize(x)
 
         assert qdata.dtype == torch.float8_e4m3fn
@@ -29,14 +55,14 @@ class TestTensorCoreFP8Layout:
         assert params.scale.dtype == torch.float32
 
     def test_quantize_with_scale(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.float16)
-        scale = torch.tensor(0.5, device="cuda")
+        x = torch.randn(64, 64, device=self.device, dtype=torch.float16)
+        scale = torch.tensor(0.5, device=self.device)
         _qdata, params = TensorCoreFP8Layout.quantize(x, scale=scale)
 
         assert torch.allclose(params.scale, scale)
 
     def test_dequantize_roundtrip(self):
-        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16) * 10
+        x = torch.randn(128, 128, device=self.device, dtype=torch.bfloat16) * 10
         qdata, params = TensorCoreFP8Layout.quantize(x)
         dq = TensorCoreFP8Layout.dequantize(qdata, params)
 
@@ -46,7 +72,7 @@ class TestTensorCoreFP8Layout:
         assert torch.allclose(dq, x, rtol=0.1, atol=0.1)
 
     def test_params_to_device(self):
-        x = torch.randn(32, 32, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(32, 32, device=self.device, dtype=torch.bfloat16)
         _, params = TensorCoreFP8Layout.quantize(x)
 
         params_cpu = params.to_device(torch.device("cpu"))
@@ -55,7 +81,7 @@ class TestTensorCoreFP8Layout:
         assert params_cpu.orig_shape == params.orig_shape
 
     def test_params_clone(self):
-        x = torch.randn(32, 32, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(32, 32, device=self.device, dtype=torch.bfloat16)
         _, params = TensorCoreFP8Layout.quantize(x)
 
         params_clone = params.clone()
@@ -108,23 +134,23 @@ class TestTensorCoreNVFP4Layout:
             TensorCoreNVFP4Layout.quantize(x)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-class TestQuantizedTensor:
+class TestQuantizedTensor(_PortableAcceleratorTest):
     """Tests for QuantizedTensor class."""
 
     def test_from_float_fp8(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         assert isinstance(qt, QuantizedTensor)
         assert qt.shape == (64, 64)
         assert qt.storage_shape == (64, 64)  # FP8 is not packed
-        assert qt.padded_shape == (64, 64)   # no packing to reverse
+        assert qt.padded_shape == (64, 64)  # no packing to reverse
         assert not qt.is_padded  # FP8 doesn't require padding
         assert qt.layout_cls is TensorCoreFP8Layout
 
     def test_from_float_nvfp4(self):
-        x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+        self.require_cuda_format()
+        x = torch.randn(128, 256, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
 
         assert isinstance(qt, QuantizedTensor)
@@ -132,25 +158,27 @@ class TestQuantizedTensor:
         assert qt.layout_cls is TensorCoreNVFP4Layout
 
     def test_shape_vs_storage_shape_aligned(self):
-        x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+        self.require_cuda_format()
+        x = torch.randn(128, 256, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
 
         assert qt.shape == (128, 256)
         assert qt.storage_shape == (128, 128)  # packed (cols / 2)
-        assert qt.padded_shape == (128, 256)   # logical shape (unpacked)
+        assert qt.padded_shape == (128, 256)  # logical shape (unpacked)
         assert not qt.is_padded  # no padding needed for 16-aligned dims
 
     def test_shape_vs_storage_shape_unaligned(self):
-        x = torch.randn(129, 130, device="cuda", dtype=torch.bfloat16)
+        self.require_cuda_format()
+        x = torch.randn(129, 130, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
 
         assert qt.shape == (129, 130)
-        assert qt.storage_shape == (144, 72)   # padded to 144x144, then packed
-        assert qt.padded_shape == (144, 144)   # logical shape after padding
+        assert qt.storage_shape == (144, 72)  # padded to 144x144, then packed
+        assert qt.padded_shape == (144, 144)  # logical shape after padding
         assert qt.is_padded  # padding was applied
 
     def test_dequantize_fp8(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16) * 5
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16) * 5
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
         dq = qt.dequantize()
 
@@ -159,7 +187,8 @@ class TestQuantizedTensor:
         assert torch.allclose(dq, x, rtol=0.1, atol=0.1)
 
     def test_dequantize_nvfp4_unpadded(self):
-        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16) * 4
+        self.require_cuda_format()
+        x = torch.randn(128, 128, device=self.device, dtype=torch.bfloat16) * 4
         qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
         dq = qt.dequantize()
 
@@ -168,7 +197,8 @@ class TestQuantizedTensor:
         assert torch.allclose(dq, x, rtol=0.5, atol=0.5)
 
     def test_dequantize_nvfp4_with_padding(self):
-        x = torch.randn(129, 130, device="cuda", dtype=torch.bfloat16) * 4
+        self.require_cuda_format()
+        x = torch.randn(129, 130, device=self.device, dtype=torch.bfloat16) * 4
         qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
         dq = qt.dequantize()
 
@@ -176,7 +206,7 @@ class TestQuantizedTensor:
         assert dq.shape == (129, 130)
 
     def test_detach(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
         qt_detached = qt.detach()
 
@@ -184,7 +214,7 @@ class TestQuantizedTensor:
         assert qt_detached._qdata is not qt._qdata
 
     def test_clone(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
         qt_cloned = qt.clone()
 
@@ -194,7 +224,7 @@ class TestQuantizedTensor:
 
     def test_to_device_roundtrip(self):
         """Test device transfer: cuda -> cpu -> cuda preserves data."""
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16) * 5
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16) * 5
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         # Move to CPU
@@ -204,9 +234,9 @@ class TestQuantizedTensor:
         assert qt_cpu._params.scale.device.type == "cpu"
 
         # Move back to CUDA
-        qt_cuda = qt_cpu.to("cuda")
-        assert qt_cuda._qdata.device.type == "cuda"
-        assert qt_cuda._params.scale.device.type == "cuda"
+        qt_cuda = qt_cpu.to(self.device)
+        assert qt_cuda._qdata.device.type == self.device
+        assert qt_cuda._params.scale.device.type == self.device
 
         # Verify data integrity
         dq_original = qt.dequantize()
@@ -214,7 +244,7 @@ class TestQuantizedTensor:
         assert torch.allclose(dq_original, dq_roundtrip)
 
     def test_to_dtype_changes_orig_dtype(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         assert qt._params.orig_dtype == torch.bfloat16
@@ -231,7 +261,7 @@ class TestQuantizedTensor:
         assert qt_half._params.orig_dtype == torch.float16
 
     def test_to_dtype_dequantize_uses_new_dtype(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_float = qt.float()
@@ -240,7 +270,7 @@ class TestQuantizedTensor:
         assert dq.dtype == torch.float32
 
     def test_to_device_and_dtype(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         # Move to CPU and change dtype
@@ -251,7 +281,7 @@ class TestQuantizedTensor:
         assert qt_cpu_float._params.orig_dtype == torch.float32
 
     def test_to_dtype_positional_arg(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_copy = qt.to(torch.float32, copy=True)
@@ -263,7 +293,7 @@ class TestQuantizedTensor:
         assert torch.equal(qt_copy._qdata, qt._qdata)
 
     def test_to_copy_without_dtype_change(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_copy = qt.to(copy=True)
@@ -274,7 +304,7 @@ class TestQuantizedTensor:
         assert qt_copy._params.orig_dtype == qt._params.orig_dtype
 
     def test_empty_like_with_dtype_preserves_qdata_format(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_empty = torch.empty_like(qt, dtype=torch.float32)
@@ -284,10 +314,10 @@ class TestQuantizedTensor:
         assert qt_empty._params.orig_dtype == torch.float32
 
     def test_empty_like_copy_pattern_preserves_dtype(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
-        r = torch.empty_like(qt, dtype=torch.float16, device="cuda")
+        r = torch.empty_like(qt, dtype=torch.float16, device=self.device)
         r.copy_(qt)
 
         assert isinstance(r, QuantizedTensor)
@@ -296,7 +326,7 @@ class TestQuantizedTensor:
         assert r.dequantize().dtype == torch.float16
 
     def test_repr(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
         r = repr(qt)
 
@@ -305,7 +335,7 @@ class TestQuantizedTensor:
         assert "(64, 64)" in r
 
     def test_params_property(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         assert qt.params is qt._params
@@ -314,7 +344,7 @@ class TestQuantizedTensor:
         assert hasattr(qt.params, "orig_shape")
 
     def test_contiguous(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         # Already contiguous - should return self
@@ -323,14 +353,14 @@ class TestQuantizedTensor:
         assert qt_contig._qdata.is_contiguous()
 
     def test_is_contiguous(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         assert qt.is_contiguous()
 
     def test_copy_(self):
-        x1 = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        x2 = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16) * 2
+        x1 = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
+        x2 = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16) * 2
 
         qt1 = QuantizedTensor.from_float(x1, "TensorCoreFP8Layout")
         qt2 = QuantizedTensor.from_float(x2, "TensorCoreFP8Layout")
@@ -342,7 +372,7 @@ class TestQuantizedTensor:
         assert torch.equal(qt1._params.scale, qt2._params.scale)
 
     def test_empty_like(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_empty = torch.empty_like(qt)
@@ -352,7 +382,7 @@ class TestQuantizedTensor:
         assert qt_empty._params.orig_dtype == qt._params.orig_dtype
 
     def test_empty_like_different_device(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_empty_cpu = torch.empty_like(qt, device="cpu")
@@ -362,7 +392,7 @@ class TestQuantizedTensor:
         assert qt_empty_cpu._params.scale.device.type == "cpu"
 
     def test_fallback_to_dequantize(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         # Operations not explicitly handled should dequantize and proceed
@@ -371,12 +401,11 @@ class TestQuantizedTensor:
         assert not isinstance(result, QuantizedTensor)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-class TestQuantizedTensorFlatten:
+class TestQuantizedTensorFlatten(_PortableAcceleratorTest):
     """Tests for tensor flattening protocol (device movement)."""
 
     def test_tensor_flatten_unflatten_fp8(self):
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         inner_tensors, ctx = qt.__tensor_flatten__()
@@ -386,7 +415,8 @@ class TestQuantizedTensorFlatten:
         assert "params_class" in ctx
 
     def test_tensor_flatten_unflatten_nvfp4(self):
-        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        self.require_cuda_format()
+        x = torch.randn(128, 128, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
 
         inner_tensors, _ctx = qt.__tensor_flatten__()
@@ -396,7 +426,8 @@ class TestQuantizedTensorFlatten:
         assert "_param_block_scale" in inner_tensors
 
     def test_tensor_flatten_unflatten_mxfp8(self):
-        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        self.require_cuda_format()
+        x = torch.randn(128, 128, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreMXFP8Layout")
 
         inner_tensors, ctx = qt.__tensor_flatten__()
@@ -406,7 +437,7 @@ class TestQuantizedTensorFlatten:
         assert "layout_cls" in ctx
 
     def test_tensor_flatten_unflatten_int8(self):
-        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(128, 128, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorWiseINT8Layout")
 
         inner_tensors, ctx = qt.__tensor_flatten__()
@@ -414,7 +445,6 @@ class TestQuantizedTensorFlatten:
         assert "_qdata" in inner_tensors
         assert "_param_scale" in inner_tensors
         assert "layout_cls" in ctx
-
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -463,14 +493,13 @@ class TestCapabilityChecking:
             assert reqs["fast_matmul_supported"] == layout_cls.supports_fast_matmul()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-class TestCopyValidation:
+class TestCopyValidation(_PortableAcceleratorTest):
     """Tests for copy operation validation."""
 
     def test_copy_non_quantized_tensor_raises(self):
         """Test that copying a regular tensor to QuantizedTensor raises TypeError."""
-        x1 = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        x2 = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x1 = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
+        x2 = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
 
         qt1 = QuantizedTensor.from_float(x1, "TensorCoreFP8Layout")
 
@@ -479,24 +508,23 @@ class TestCopyValidation:
 
     def test_copy_mismatched_layouts_raises(self):
         """Test that copying between different layouts raises TypeError."""
-        x1 = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
-        x2 = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        x1 = torch.randn(128, 128, device=self.device, dtype=torch.bfloat16)
+        x2 = torch.randn(128, 128, device=self.device, dtype=torch.bfloat16)
 
         qt1 = QuantizedTensor.from_float(x1, "TensorCoreFP8Layout")
-        qt2 = QuantizedTensor.from_float(x2, "TensorCoreNVFP4Layout")
+        qt2 = QuantizedTensor.from_float(x2, "TensorWiseINT8Layout")
 
         with pytest.raises(TypeError, match="Layout mismatch"):
             qt1.copy_(qt2)
 
 
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-class TestBaseLayoutParams:
+class TestBaseLayoutParams(_PortableAcceleratorTest):
     """Tests for BaseLayoutParams functionality."""
 
     def test_nvfp4_params_tensor_fields(self):
+        self.require_cuda_format()
         """Test that NVFP4 Params correctly lists tensor fields."""
-        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(128, 128, device=self.device, dtype=torch.bfloat16)
         _, params = TensorCoreNVFP4Layout.quantize(x)
 
         tensor_fields = params._tensor_fields()
@@ -506,8 +534,9 @@ class TestBaseLayoutParams:
         assert len(tensor_fields) == 2
 
     def test_nvfp4_params_to_device_moves_all_tensors(self):
+        self.require_cuda_format()
         """Test that NVFP4 Params.to_device moves all tensor fields."""
-        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(128, 128, device=self.device, dtype=torch.bfloat16)
         _, params = TensorCoreNVFP4Layout.quantize(x)
 
         params_cpu = params.to_device(torch.device("cpu"))
@@ -515,12 +544,13 @@ class TestBaseLayoutParams:
         assert params_cpu.scale.device.type == "cpu"
         assert params_cpu.block_scale.device.type == "cpu"
         # Original unchanged
-        assert params.scale.device.type == "cuda"
-        assert params.block_scale.device.type == "cuda"
+        assert params.scale.device.type == self.device
+        assert params.block_scale.device.type == self.device
 
     def test_nvfp4_params_clone_copies_all_tensors(self):
+        self.require_cuda_format()
         """Test that NVFP4 Params.clone creates independent copies of all tensors."""
-        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(128, 128, device=self.device, dtype=torch.bfloat16)
         _, params = TensorCoreNVFP4Layout.quantize(x)
 
         params_clone = params.clone()
@@ -532,19 +562,22 @@ class TestBaseLayoutParams:
         assert torch.equal(params_clone.scale, params.scale)
         assert torch.equal(params_clone.block_scale, params.block_scale)
 
-    @pytest.mark.parametrize("layout_cls", [TensorCoreFP8Layout, TensorCoreNVFP4Layout, TensorCoreMXFP8Layout])
+    @pytest.mark.parametrize(
+        "layout_cls", [TensorCoreFP8Layout, TensorCoreNVFP4Layout, TensorCoreMXFP8Layout]
+    )
     def test_params_inherits_from_base(self, layout_cls):
+        if layout_cls is not TensorCoreFP8Layout:
+            self.require_cuda_format()
         assert issubclass(layout_cls.Params, BaseLayoutParams)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-class TestParamsDtypeValidation:
+class TestParamsDtypeValidation(_PortableAcceleratorTest):
     """Tests for automatic dtype validation and conversion in Params."""
 
     def test_fp8_params_scale_dtype_auto_conversion(self):
         """Test that FP8 Params automatically converts scale to float32."""
         # Create scale with wrong dtype (float16)
-        scale_f16 = torch.tensor([1.0], device="cuda", dtype=torch.float16)
+        scale_f16 = torch.tensor([1.0], device=self.device, dtype=torch.float16)
 
         # Creating Params should auto-convert to float32
         params = TensorCoreFP8Layout.Params(
@@ -555,21 +588,21 @@ class TestParamsDtypeValidation:
 
         # Verify scale was converted to float32
         assert params.scale.dtype == torch.float32
-        assert params.scale.device.type == "cuda"
+        assert params.scale.device.type == self.device
         assert params.scale.item() == 1.0
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-class TestFP8LinearOperations:
+
+class TestFP8LinearOperations(_PortableAcceleratorTest):
     """Tests for FP8 linear, mm, addmm operations."""
 
     def test_fp8_linear_both_quantized(self):
         """Test FP8 linear with both input and weight quantized."""
-        if not TensorCoreFP8Layout.supports_fast_matmul():
+        if self.device == "cuda" and not TensorCoreFP8Layout.supports_fast_matmul():
             pytest.skip("FP8 matmul not supported on this hardware")
 
         batch, in_features, out_features = 32, 64, 128
-        x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
-        w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(batch, in_features, device=self.device, dtype=torch.bfloat16)
+        w = torch.randn(out_features, in_features, device=self.device, dtype=torch.bfloat16)
 
         qt_x = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
         qt_w = QuantizedTensor.from_float(w, "TensorCoreFP8Layout")
@@ -582,13 +615,13 @@ class TestFP8LinearOperations:
 
     def test_fp8_linear_with_bias(self):
         """Test FP8 linear with bias."""
-        if not TensorCoreFP8Layout.supports_fast_matmul():
+        if self.device == "cuda" and not TensorCoreFP8Layout.supports_fast_matmul():
             pytest.skip("FP8 matmul not supported on this hardware")
 
         batch, in_features, out_features = 16, 32, 64
-        x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
-        w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
-        b = torch.randn(out_features, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(batch, in_features, device=self.device, dtype=torch.bfloat16)
+        w = torch.randn(out_features, in_features, device=self.device, dtype=torch.bfloat16)
+        b = torch.randn(out_features, device=self.device, dtype=torch.bfloat16)
 
         qt_x = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
         qt_w = QuantizedTensor.from_float(w, "TensorCoreFP8Layout")
@@ -601,12 +634,12 @@ class TestFP8LinearOperations:
 
     def test_fp8_linear_3d_input(self):
         """Test FP8 linear with 3D input (batch, seq, features)."""
-        if not TensorCoreFP8Layout.supports_fast_matmul():
+        if self.device == "cuda" and not TensorCoreFP8Layout.supports_fast_matmul():
             pytest.skip("FP8 matmul not supported on this hardware")
 
         batch, seq_len, in_features, out_features = 4, 16, 64, 128
-        x = torch.randn(batch, seq_len, in_features, device="cuda", dtype=torch.bfloat16)
-        w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(batch, seq_len, in_features, device=self.device, dtype=torch.bfloat16)
+        w = torch.randn(out_features, in_features, device=self.device, dtype=torch.bfloat16)
 
         qt_x = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
         qt_w = QuantizedTensor.from_float(w, "TensorCoreFP8Layout")
@@ -620,8 +653,8 @@ class TestFP8LinearOperations:
     def test_fp8_linear_single_quantized_fallback(self):
         """Test FP8 linear with only one operand quantized (fallback path)."""
         batch, in_features, out_features = 16, 32, 64
-        x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
-        w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(batch, in_features, device=self.device, dtype=torch.bfloat16)
+        w = torch.randn(out_features, in_features, device=self.device, dtype=torch.bfloat16)
 
         qt_x = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
         qt_w = QuantizedTensor.from_float(w, "TensorCoreFP8Layout")
@@ -638,12 +671,12 @@ class TestFP8LinearOperations:
 
     def test_fp8_mm(self):
         """Test FP8 matrix multiplication."""
-        if not TensorCoreFP8Layout.supports_fast_matmul():
+        if self.device == "cuda" and not TensorCoreFP8Layout.supports_fast_matmul():
             pytest.skip("FP8 matmul not supported on this hardware")
 
         m, k, n = 64, 128, 256
-        a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-        b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
+        a = torch.randn(m, k, device=self.device, dtype=torch.bfloat16)
+        b = torch.randn(k, n, device=self.device, dtype=torch.bfloat16)
 
         qt_a = QuantizedTensor.from_float(a, "TensorCoreFP8Layout")
         qt_b = QuantizedTensor.from_float(b, "TensorCoreFP8Layout")
@@ -657,8 +690,8 @@ class TestFP8LinearOperations:
     def test_fp8_mm_single_quantized_fallback(self):
         """Test FP8 mm with only one operand quantized (fallback path)."""
         m, k, n = 32, 64, 128
-        a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-        b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
+        a = torch.randn(m, k, device=self.device, dtype=torch.bfloat16)
+        b = torch.randn(k, n, device=self.device, dtype=torch.bfloat16)
 
         qt_a = QuantizedTensor.from_float(a, "TensorCoreFP8Layout")
 
@@ -670,13 +703,13 @@ class TestFP8LinearOperations:
 
     def test_fp8_addmm(self):
         """Test FP8 addmm: bias + input @ weight."""
-        if not TensorCoreFP8Layout.supports_fast_matmul():
+        if self.device == "cuda" and not TensorCoreFP8Layout.supports_fast_matmul():
             pytest.skip("FP8 matmul not supported on this hardware")
 
         m, k, n = 32, 64, 128
-        bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
-        a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-        b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(n, device=self.device, dtype=torch.bfloat16)
+        a = torch.randn(m, k, device=self.device, dtype=torch.bfloat16)
+        b = torch.randn(k, n, device=self.device, dtype=torch.bfloat16)
 
         qt_a = QuantizedTensor.from_float(a, "TensorCoreFP8Layout")
         qt_b = QuantizedTensor.from_float(b, "TensorCoreFP8Layout")
@@ -690,9 +723,9 @@ class TestFP8LinearOperations:
     def test_fp8_addmm_fallback(self):
         """Test FP8 addmm with single quantized operand (fallback path)."""
         m, k, n = 32, 64, 128
-        bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
-        a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-        b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(n, device=self.device, dtype=torch.bfloat16)
+        a = torch.randn(m, k, device=self.device, dtype=torch.bfloat16)
+        b = torch.randn(k, n, device=self.device, dtype=torch.bfloat16)
 
         qt_a = QuantizedTensor.from_float(a, "TensorCoreFP8Layout")
 
@@ -705,12 +738,12 @@ class TestFP8LinearOperations:
 
     def test_fp8_linear_output_dtype(self):
         """Test that FP8 linear output has correct dtype."""
-        if not TensorCoreFP8Layout.supports_fast_matmul():
+        if self.device == "cuda" and not TensorCoreFP8Layout.supports_fast_matmul():
             pytest.skip("FP8 matmul not supported on this hardware")
 
         batch, in_features, out_features = 16, 32, 64
-        x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
-        w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(batch, in_features, device=self.device, dtype=torch.bfloat16)
+        w = torch.randn(out_features, in_features, device=self.device, dtype=torch.bfloat16)
 
         qt_x = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
         qt_w = QuantizedTensor.from_float(w, "TensorCoreFP8Layout")
@@ -722,13 +755,13 @@ class TestFP8LinearOperations:
 
     def test_fp8_linear_different_scales(self):
         """Test FP8 linear with different input/weight scales."""
-        if not TensorCoreFP8Layout.supports_fast_matmul():
+        if self.device == "cuda" and not TensorCoreFP8Layout.supports_fast_matmul():
             pytest.skip("FP8 matmul not supported on this hardware")
 
         batch, in_features, out_features = 16, 32, 64
         # Use different value ranges to get different scales
-        x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16) * 10
-        w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16) * 0.1
+        x = torch.randn(batch, in_features, device=self.device, dtype=torch.bfloat16) * 10
+        w = torch.randn(out_features, in_features, device=self.device, dtype=torch.bfloat16) * 0.1
 
         qt_x = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
         qt_w = QuantizedTensor.from_float(w, "TensorCoreFP8Layout")
@@ -742,13 +775,12 @@ class TestFP8LinearOperations:
         assert torch.allclose(result, expected, rtol=0.2, atol=0.2)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-class TestFP8ViewOperations:
+class TestFP8ViewOperations(_PortableAcceleratorTest):
     """Tests for FP8 view, transpose, reshape operations."""
 
     def test_fp8_view(self):
         """Test FP8 view preserves quantization."""
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_viewed = qt.view(16, 256)
@@ -761,7 +793,7 @@ class TestFP8ViewOperations:
 
     def test_fp8_view_multiple_shapes(self):
         """Test FP8 view with various shape transformations."""
-        x = torch.randn(2, 3, 4, 5, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(2, 3, 4, 5, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         # Flatten
@@ -781,7 +813,7 @@ class TestFP8ViewOperations:
 
     def test_fp8_transpose(self):
         """Test FP8 transpose preserves quantization."""
-        x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(32, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_t = qt.t()
@@ -794,7 +826,7 @@ class TestFP8ViewOperations:
 
     def test_fp8_reshape(self):
         """Test FP8 reshape preserves quantization."""
-        x = torch.randn(4, 8, 16, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(4, 8, 16, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_reshaped = qt.reshape(32, 16)
@@ -805,7 +837,7 @@ class TestFP8ViewOperations:
 
     def test_fp8_reshape_with_minus_one(self):
         """Test FP8 reshape with inferred dimension."""
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_reshaped = qt.reshape(-1, 128)
@@ -813,14 +845,17 @@ class TestFP8ViewOperations:
         assert qt_reshaped.shape == (32, 128)
         assert isinstance(qt_reshaped, QuantizedTensor)
 
-    @pytest.mark.parametrize("op_name,input_shape,op_args", [
-        ("view", (64, 64), ((16, 256),)),
-        ("t", (32, 64), ()),
-        ("reshape", (4, 8, 16), ((32, 16),)),
-    ])
+    @pytest.mark.parametrize(
+        "op_name,input_shape,op_args",
+        [
+            ("view", (64, 64), ((16, 256),)),
+            ("t", (32, 64), ()),
+            ("reshape", (4, 8, 16), ((32, 16),)),
+        ],
+    )
     def test_fp8_shape_op_dequantize_consistency(self, op_name, input_shape, op_args):
         """Test that shape op then dequantize matches dequantize then shape op."""
-        x = torch.randn(*input_shape, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(*input_shape, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_op = getattr(qt, op_name)
@@ -833,7 +868,7 @@ class TestFP8ViewOperations:
 
     def test_fp8_chained_shape_ops(self):
         """Test chaining multiple shape operations."""
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         # Chain: view -> reshape -> view
@@ -846,13 +881,13 @@ class TestFP8ViewOperations:
 
     def test_fp8_shape_op_then_linear(self):
         """Test shape op followed by linear operation."""
-        if not TensorCoreFP8Layout.supports_fast_matmul():
+        if self.device == "cuda" and not TensorCoreFP8Layout.supports_fast_matmul():
             pytest.skip("FP8 matmul not supported on this hardware")
 
         batch, seq, features = 4, 8, 64
         out_features = 128
-        x = torch.randn(batch, seq, features, device="cuda", dtype=torch.bfloat16)
-        w = torch.randn(out_features, features, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(batch, seq, features, device=self.device, dtype=torch.bfloat16)
+        w = torch.randn(out_features, features, device=self.device, dtype=torch.bfloat16)
 
         qt_x = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
         qt_w = QuantizedTensor.from_float(w, "TensorCoreFP8Layout")
@@ -869,7 +904,7 @@ class TestFP8ViewOperations:
 
     def test_fp8_orig_shape_updated(self):
         """Test that orig_shape is updated after shape operations."""
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=self.device, dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         assert qt._params.orig_shape == (64, 64)
@@ -1132,7 +1167,6 @@ class TestNVFP4ShapeOperationsFallback:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestTensorCoreMXFP8Layout:
-
     def test_quantize_aligned(self):
         x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
         qdata, params = TensorCoreMXFP8Layout.quantize(x)
@@ -1177,7 +1211,6 @@ class TestTensorCoreMXFP8Layout:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestMXFP8LinearOperations:
-
     def test_mxfp8_linear_both_quantized(self):
         if not TensorCoreMXFP8Layout.supports_fast_matmul():
             pytest.skip("MXFP8 matmul not supported on this hardware (requires SM >= 10.0)")
@@ -1293,7 +1326,6 @@ class TestMXFP8LinearOperations:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestMXFP8ShapeOperationsFallback:
-
     def test_mxfp8_view_falls_back(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreMXFP8Layout")
@@ -1345,12 +1377,11 @@ class TestMXFP8ShapeOperationsFallback:
         assert torch.equal(result, expected)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-class TestTensorWiseINT8Layout:
+class TestTensorWiseINT8Layout(_PortableAcceleratorTest):
     """Tests for TensorWiseINT8Layout."""
 
     def test_quantize_weight(self):
-        x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(128, 256, device=self.device, dtype=torch.bfloat16)
         qdata, params = TensorWiseINT8Layout.quantize(x, is_weight=True)
 
         assert qdata.dtype == torch.int8
@@ -1359,7 +1390,7 @@ class TestTensorWiseINT8Layout:
         assert params.is_weight is True
 
     def test_quantize_activation(self):
-        x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(128, 256, device=self.device, dtype=torch.bfloat16)
         qdata, params = TensorWiseINT8Layout.quantize(x, is_weight=False)
 
         assert qdata.dtype == torch.int8
@@ -1368,7 +1399,7 @@ class TestTensorWiseINT8Layout:
         assert params.is_weight is False
 
     def test_dequantize_roundtrip(self):
-        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16) * 10
+        x = torch.randn(128, 128, device=self.device, dtype=torch.bfloat16) * 10
         qdata, params = TensorWiseINT8Layout.quantize(x)
         dq = TensorWiseINT8Layout.dequantize(qdata, params)
 
@@ -1378,17 +1409,16 @@ class TestTensorWiseINT8Layout:
         assert torch.allclose(dq, x, rtol=0.2, atol=0.2)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-class TestINT8LinearOperations:
+class TestINT8LinearOperations(_PortableAcceleratorTest):
     """Tests for INT8 linear operations using QuantizedTensor."""
 
     def test_int8_linear_weight_quantized(self):
         import comfy_kitchen as ck
 
         batch, in_features, out_features = 32, 64, 128
-        x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
-        w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
-        bias = torch.randn(out_features, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(batch, in_features, device=self.device, dtype=torch.bfloat16)
+        w = torch.randn(out_features, in_features, device=self.device, dtype=torch.bfloat16)
+        bias = torch.randn(out_features, device=self.device, dtype=torch.bfloat16)
 
         qt_w = QuantizedTensor.from_float(w, "TensorWiseINT8Layout")
 
@@ -1399,14 +1429,22 @@ class TestINT8LinearOperations:
             expected = torch.nn.functional.linear(x, qt_w, bias)
 
         assert result.shape == expected.shape
-        assert torch.allclose(result, expected, rtol=1e-2, atol=1e-1)
+        if self.device == "xpu":
+            # oneDNN fuses rescaling into the BF16 matmul, while eager uses
+            # an INT32-then-float sequence. Match the established XPU kernel
+            # acceptance bounds in tests/test_xpu.py.
+            error = (result.float() - expected.float()).abs()
+            assert error.mean().item() < 0.15
+            assert error.max().item() < 0.75
+        else:
+            assert torch.allclose(result, expected, rtol=1e-2, atol=1e-1)
 
     def test_int8_mm(self):
         import comfy_kitchen as ck
 
         m, k, n = 64, 128, 256
-        a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-        b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) # (out, in)
+        a = torch.randn(m, k, device=self.device, dtype=torch.bfloat16)
+        b = torch.randn(n, k, device=self.device, dtype=torch.bfloat16)  # (out, in)
 
         qt_b = QuantizedTensor.from_float(b, "TensorWiseINT8Layout")
 
@@ -1416,4 +1454,9 @@ class TestINT8LinearOperations:
             expected = torch.mm(a, qt_b.t())
 
         assert result.shape == expected.shape
-        assert torch.allclose(result, expected, rtol=1e-2, atol=1e-1)
+        if self.device == "xpu":
+            error = (result.float() - expected.float()).abs()
+            assert error.mean().item() < 0.15
+            assert error.max().item() < 0.75
+        else:
+            assert torch.allclose(result, expected, rtol=1e-2, atol=1e-1)

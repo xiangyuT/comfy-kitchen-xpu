@@ -4,29 +4,19 @@ import re
 import shutil
 import subprocess
 import sys
+import zipfile
 from typing import ClassVar
-
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
 
 import setuptools
 from setuptools import Extension
 from setuptools.command.build_ext import build_ext
 
-# Parse command-line early to check for --no-cuda flag
-# This needs to happen before get_extensions() is called
-# Usage: python setup.py install --no-cuda
-#    or: pip install . --no-cuda
-BUILD_NO_CUDA = False
+# This fork ships one pure-Python Kitchen wheel for Intel XPU. Keep the upstream
+# CUDA build implementation below to make future upstream synchronization
+# reviewable, but never enter it from this branch's packaging entry point.
+BUILD_NO_CUDA = True
 if "--no-cuda" in sys.argv:
-    BUILD_NO_CUDA = True
-    sys.argv.remove("--no-cuda")  # Remove so setuptools doesn't complain
-    print("\n" + "=" * 80)
-    print("Building CPU-only variant (--no-cuda flag)")
-    print("CUDA backend excluded - only eager, triton backends")
-    print("=" * 80 + "\n")
+    sys.argv.remove("--no-cuda")
 
 
 class CMakeExtension(Extension):
@@ -257,25 +247,12 @@ def setup_cuda_extension() -> CMakeExtension | None:
 
 
 def get_extensions() -> list[setuptools.Extension]:
-    extensions = []
-
-    if BUILD_NO_CUDA:
-        print("\n" + "=" * 80)
-        print("Building CPU-only variant (COMFY_KITCHEN_BUILD_NO_CUDA=1)")
-        print("CUDA backend excluded - only eager, triton backends")
-        print("=" * 80 + "\n")
-        return extensions
-
-    cuda_ext = setup_cuda_extension()
-    if cuda_ext is not None:
-        extensions.append(cuda_ext)
-    else:
-        print("\n" + "=" * 80)
-        print("Installing comfy_kitchen without CUDA backend")
-        print("Available backends: eager, triton (if installed)")
-        print("=" * 80 + "\n")
-
-    return extensions
+    print("\n" + "=" * 80)
+    print("Building the Intel XPU pure-Python wheel")
+    print("CUDA source is retained in Git but is not compiled or packaged")
+    print("Packaged backends: xpu, triton, eager")
+    print("=" * 80 + "\n")
+    return []
 
 
 def get_cmdclass(has_extensions):
@@ -287,15 +264,41 @@ def get_cmdclass(has_extensions):
     try:
         from wheel.bdist_wheel import bdist_wheel
 
-        class CUDABdistWheel(bdist_wheel):
+        class XpuBdistWheel(bdist_wheel):
             def finalize_options(self):
                 super().finalize_options()
-                # Set stable ABI tag only for Python 3.12+ (nanobind requirement)
-                # For 3.10/3.11, leave as version-specific (cpXXX-cpXXX)
-                if not BUILD_NO_CUDA and sys.version_info >= (3, 12):
-                    self.py_limited_api = "cp312"
 
-        cmdclass["bdist_wheel"] = CUDABdistWheel
+            def run(self):
+                super().run()
+                wheels = sorted(
+                    pathlib.Path(self.dist_dir).glob("comfy_kitchen-*.whl"),
+                    key=lambda path: path.stat().st_mtime_ns,
+                )
+                if not wheels:
+                    raise RuntimeError("XPU wheel validation could not find the built wheel")
+                with zipfile.ZipFile(wheels[-1]) as wheel:
+                    names = wheel.namelist()
+                leaked_cuda = [
+                    name for name in names if name.startswith("comfy_kitchen/backends/cuda/")
+                ]
+                if leaked_cuda:
+                    raise RuntimeError(
+                        "XPU wheel contains CUDA backend files: " + ", ".join(leaked_cuda)
+                    )
+                required_backends = ("xpu", "triton", "eager")
+                missing = [
+                    backend
+                    for backend in required_backends
+                    if not any(
+                        name.startswith(f"comfy_kitchen/backends/{backend}/") for name in names
+                    )
+                ]
+                if missing:
+                    raise RuntimeError(
+                        "XPU wheel is missing packaged backends: " + ", ".join(missing)
+                    )
+
+        cmdclass["bdist_wheel"] = XpuBdistWheel
     except ImportError as e:
         print(f"Warning: Could not import wheel.bdist_wheel: {e}")
 
@@ -327,31 +330,5 @@ setup_kwargs = {
     "ext_modules": extensions,
     "cmdclass": get_cmdclass(has_extensions=bool(extensions)),
 }
-
-if BUILD_NO_CUDA:
-    with open("pyproject.toml", "rb") as f:
-        pyproject = tomllib.load(f)
-
-    project_meta = pyproject.get("project", {})
-    version = project_meta.get("version", "0.1.0")
-    description = project_meta.get("description", "")
-
-    setup_kwargs.update({
-        "packages": get_packages(),
-        "name": "comfy-kitchen",
-        "version": version,
-        "description": f"{description} (CPU-only)",
-        "include_package_data": False,
-        "install_requires": [
-            "torch>=2.5.0",
-        ],
-    })
-
-    readme_path = pathlib.Path("README.md")
-    if readme_path.exists():
-        setup_kwargs.update({
-            "long_description": readme_path.read_text(),
-            "long_description_content_type": "text/markdown",
-        })
 
 setuptools.setup(**setup_kwargs)

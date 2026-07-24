@@ -29,6 +29,7 @@ __all__ = [
     "scaled_mm_svdquant_w4a4",
     "stochastic_rounding_fp8",
     "int8_linear",
+    "mm_int8",
 ]
 
 import torch
@@ -57,6 +58,7 @@ from .quantization import (
     dequantize_nvfp4,
     dequantize_per_tensor_fp8,
     int8_linear,
+    mm_int8,
     quantize_and_rotate_rowwise,
     quantize_int8_convrot_weight,
     quantize_int8_rowwise,
@@ -344,6 +346,13 @@ def _build_constraints() -> dict:
             "bias": ParamConstraint(dtypes=standard_floats),
             "convrot": ParamConstraint(dtypes=frozenset({bool})),
             "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["mm_int8"] = FunctionConstraints(
+        params={
+            "a": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
+            "b": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
         },
         default_devices=all_devices,
     )

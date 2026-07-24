@@ -140,6 +140,27 @@ def _handle_fp8_linear(qt, args, kwargs):
     input_tensor, weight = args[0], args[1]
     bias = args[2] if len(args) > 2 else None
 
+    # Intel XPU weight-only fast path: float activation + FP8 weight.
+    if (
+        isinstance(input_tensor, torch.Tensor)
+        and not isinstance(input_tensor, QuantizedTensor)
+        and isinstance(weight, QuantizedTensor)
+        and input_tensor.device.type == "xpu"
+    ):
+        try:
+            from comfy_kitchen.backends import xpu as xpu_backend
+            from comfy_kitchen.backends.xpu.fp8 import fp8_weight_only_linear
+
+            if xpu_backend._FP8_AVAILABLE:
+                return fp8_weight_only_linear(
+                    input_tensor,
+                    weight._qdata,
+                    weight._params.scale,
+                    bias,
+                )
+        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+            logger.debug("XPU FP8 W8A16 fast path unavailable: %s", exc)
+
     # Fast path: both operands are FP8 QuantizedTensors
     if not (isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor)):
         return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
@@ -174,6 +195,21 @@ def _handle_fp8_mm(qt, args, kwargs):
     """FP8 matrix multiplication: output = a @ b"""
     a, b = args[0], args[1]
 
+    if (
+        isinstance(a, torch.Tensor)
+        and not isinstance(a, QuantizedTensor)
+        and isinstance(b, QuantizedTensor)
+        and a.device.type == "xpu"
+    ):
+        try:
+            from comfy_kitchen.backends import xpu as xpu_backend
+            from comfy_kitchen.backends.xpu.fp8 import fp8_weight_only_linear
+
+            if xpu_backend._FP8_AVAILABLE:
+                return fp8_weight_only_linear(a, b._qdata.t(), b._params.scale)
+        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+            logger.debug("XPU FP8 W8A16 mm fast path unavailable: %s", exc)
+
     if not (isinstance(a, QuantizedTensor) and isinstance(b, QuantizedTensor)):
         return torch.mm(*dequantize_args(args))
 
@@ -191,6 +227,26 @@ def _handle_fp8_mm(qt, args, kwargs):
 def _handle_fp8_addmm(qt, args, kwargs):
     """FP8 addmm: output = bias + input @ weight"""
     bias, input_tensor, weight = args[0], args[1], args[2]
+
+    if (
+        isinstance(input_tensor, torch.Tensor)
+        and not isinstance(input_tensor, QuantizedTensor)
+        and isinstance(weight, QuantizedTensor)
+        and input_tensor.device.type == "xpu"
+    ):
+        try:
+            from comfy_kitchen.backends import xpu as xpu_backend
+            from comfy_kitchen.backends.xpu.fp8 import fp8_weight_only_linear
+
+            if xpu_backend._FP8_AVAILABLE:
+                return fp8_weight_only_linear(
+                    input_tensor,
+                    weight._qdata.t(),
+                    weight._params.scale,
+                    bias,
+                )
+        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+            logger.debug("XPU FP8 W8A16 addmm fast path unavailable: %s", exc)
 
     if not (isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor)):
         return torch.addmm(*dequantize_args(args))

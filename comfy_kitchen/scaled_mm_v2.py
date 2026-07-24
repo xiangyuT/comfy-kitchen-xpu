@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+
 from packaging import version
 
 _TORCH_VERSION = version.parse(torch.__version__.split("+")[0])  # Remove git hash suffix

@@ -1,12 +1,12 @@
 import torch
 
-from .backends import cuda as _cuda_backend  # noqa: F401
+from ._version import __version__
 
 # Import backends to trigger auto-registration
 from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
+from .backends import xpu as _xpu_backend  # noqa: F401
 from .backends.eager.quantization import DTYPE_TO_CODE
-from .backends.eager.quantization import mm_int8 as _mm_int8
 from .exceptions import (
     BackendError,
     BackendNotFoundError,
@@ -23,9 +23,8 @@ from .tensor.convrot_w4a4 import (
     quantize_convrot_w4a4_weight,
 )
 
-__version__ = "0.1.0"
-
 __all__ = [
+    "__version__",
     # Normalization
     "adaln",
     # Quantization / dequantization
@@ -522,7 +521,9 @@ def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
 
 def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N]."""
-    return _mm_int8(a, b)
+    kwargs = {"a": a, "b": b}
+    impl = registry.get_implementation("mm_int8", kwargs=kwargs)
+    return impl(**kwargs)
 
 
 def int8_linear(
@@ -550,17 +551,16 @@ def int8_linear(
     """
     if out_dtype is None:
         out_dtype = torch.bfloat16
-    kwargs = {
-        "x": x,
-        "weight": weight,
-        "weight_scale": weight_scale,
-        "bias": bias,
-        "out_dtype": out_dtype,
-        "convrot": convrot,
-        "convrot_groupsize": convrot_groupsize,
-    }
-    impl = registry.get_implementation("int8_linear", kwargs=kwargs)
-    return impl(**kwargs)
+    dtype_code = DTYPE_TO_CODE[out_dtype]
+    return torch.ops.comfy_kitchen.int8_linear(
+        x,
+        weight,
+        weight_scale,
+        bias,
+        dtype_code,
+        convrot,
+        convrot_groupsize,
+    )
 
 
 # =============================================================================
@@ -573,7 +573,7 @@ def set_backend_priority(priority: list[str]) -> None:
 
     Args:
         priority: List of backend names in order of preference
-                 Example: ["cuda", "eager"] to prefer CUDA over Torch
+                 Example: ["xpu", "triton", "eager"]
     """
     registry.set_priority(priority)
 
@@ -582,7 +582,7 @@ def disable_backend(name: str) -> None:
     """Disable a backend, preventing its use.
 
     Args:
-        name: Backend name to disable ("eager", "cuda", or "triton")
+        name: Backend name to disable ("xpu", "triton", or "eager")
     """
     registry.disable(name)
 
@@ -591,7 +591,7 @@ def enable_backend(name: str) -> None:
     """Re-enable a previously disabled backend.
 
     Args:
-        name: Backend name to enable ("eager", "cuda", or "triton")
+        name: Backend name to enable ("xpu", "triton", or "eager")
     """
     registry.enable(name)
 

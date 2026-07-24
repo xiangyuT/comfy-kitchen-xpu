@@ -6,6 +6,7 @@ import comfy_kitchen as ck
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "cuda: mark test as requiring CUDA")
+    config.addinivalue_line("markers", "xpu: mark test as requiring Intel XPU")
     config.addinivalue_line("markers", "slow: mark test as slow running")
     config.addinivalue_line("markers", "cupy: mark test as requiring CuPy")
 
@@ -52,7 +53,7 @@ def get_capable_backends(func_name: str, device: str | None = None) -> list[str]
     capable = []
     backends = ck.list_backends()
 
-    for backend_name in ["cuda", "triton", "eager"]:
+    for backend_name in ["cuda", "xpu", "triton", "eager"]:
         if not backends.get(backend_name, {}).get("available", False):
             continue
 
@@ -74,7 +75,7 @@ def get_supported_devices(func_name: str) -> set[str]:
     devices = set()
     backends = ck.list_backends()
 
-    for backend_name in ["cuda", "triton", "eager"]:
+    for backend_name in ["cuda", "xpu", "triton", "eager"]:
         if not backends.get(backend_name, {}).get("available", False):
             continue
 

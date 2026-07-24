@@ -65,6 +65,19 @@ def test_eager_int8_matmul_turing_n_alignment(monkeypatch):
     assert calls == [0]
 
 
+def test_public_mm_int8_uses_registry_on_cpu():
+    """The public raw INT8 matmul remains functional after backend dispatch."""
+    a = torch.randint(-8, 8, (4, 16), dtype=torch.int8)
+    b = torch.randint(-8, 8, (16, 6), dtype=torch.int8)
+
+    with ck.use_backend("eager"):
+        result = ck.mm_int8(a, b)
+
+    expected = a.to(torch.int32) @ b.to(torch.int32)
+    assert result.dtype == torch.int32
+    assert torch.equal(result, expected)
+
+
 def test_cuda_int8_linear_does_not_retain_scratch_tensors():
     """CUDA INT8 linear uses per-call temporaries instead of retained scratch caches."""
     if not torch.cuda.is_available():
