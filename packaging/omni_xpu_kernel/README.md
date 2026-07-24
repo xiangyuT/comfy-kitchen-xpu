@@ -41,8 +41,8 @@ EXPECTED_XPU_TARGET=ptl-h \
 Generated wheels are stored under Kitchen's `wheelhouse/omni_xpu_kernel/` and
 are ignored by Git. The uv environments, compiler output, egg-info, and local
 extensions stay under the llm-scaler Kernel checkout, where they are also
-ignored. Release artifacts are uploaded by
-`.github/workflows/build-omni-xpu-wheels.yml`.
+ignored. Release artifacts are produced and validated manually; this repository
+does not publish them through GitHub Actions.
 
 The build venv installs `onednn==2025.3.0` plus matching
 `onednn-devel==2025.3.0` headers. The clean runtime venv deliberately installs
