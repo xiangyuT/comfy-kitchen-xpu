@@ -1,5 +1,4 @@
 import logging
-import sys
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
@@ -24,10 +23,7 @@ class BackendRegistry:
         self._capabilities = {}  # {name: set of function names}
         self._constraints = {}  # {(backend_name, func_name): FunctionConstraints}
         self._priority = ["xpu", "triton", "eager"]
-        # Triton requires a working JIT compiler/runtime on Windows and is not
-        # part of the validated XPU Portable path. Keep it registered for
-        # inspection and explicit opt-in via enable_backend("triton").
-        self._disabled = {"triton"} if sys.platform == "win32" else set()
+        self._disabled = set()  # Manually disabled backends
         self._unavailable = {}  # {name: error_message} for failed backends
         self._lock = threading.Lock()
         self._thread_local = threading.local()

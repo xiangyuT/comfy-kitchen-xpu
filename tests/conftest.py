@@ -54,11 +54,10 @@ def get_capable_backends(func_name: str, device: str | None = None) -> list[str]
     backends = ck.list_backends()
 
     for backend_name in ["cuda", "xpu", "triton", "eager"]:
-        status = backends.get(backend_name, {})
-        if not status.get("available", False) or status.get("disabled", False):
+        if not backends.get(backend_name, {}).get("available", False):
             continue
 
-        if func_name not in status.get("capabilities", []):
+        if func_name not in backends[backend_name].get("capabilities", []):
             continue
 
         # Check device constraint if specified
@@ -77,11 +76,10 @@ def get_supported_devices(func_name: str) -> set[str]:
     backends = ck.list_backends()
 
     for backend_name in ["cuda", "xpu", "triton", "eager"]:
-        status = backends.get(backend_name, {})
-        if not status.get("available", False) or status.get("disabled", False):
+        if not backends.get(backend_name, {}).get("available", False):
             continue
 
-        if func_name not in status.get("capabilities", []):
+        if func_name not in backends[backend_name].get("capabilities", []):
             continue
 
         constraints = ck.registry.get_constraints(backend_name, func_name)

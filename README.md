@@ -75,15 +75,14 @@ only the operations it actually implements. Triton remains available on
 non-Windows XPU stacks that support it, with eager implementations as the
 portable fallback.
 
-On Windows, Triton is registered but disabled by default because its JIT
+On Windows, Triton is reported as unavailable by default because its JIT
 compiler/runtime is not part of the validated XPU Portable path. Dispatch uses
 the XPU backend first and then eager. An advanced environment with a working
-Windows Triton toolchain can opt in explicitly:
+Windows Triton toolchain can restore the original probing and registration
+behavior by setting this variable before importing `comfy_kitchen`:
 
-```python
-import comfy_kitchen as ck
-
-ck.enable_backend("triton")
+```powershell
+$env:COMFY_KITCHEN_ENABLE_TRITON_WINDOWS = "1"
 ```
 
 Check the active runtime explicitly:
