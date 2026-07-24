@@ -71,8 +71,20 @@ The XPU backend becomes available only when:
 
 Optional SVDQuant, normalization, FP8, RoPE, and ConvRot capability groups are
 detected separately. A partial or older native package therefore advertises
-only the operations it actually implements. Triton remains available on XPU
-stacks that support it, with eager implementations as the portable fallback.
+only the operations it actually implements. Triton remains available on
+non-Windows XPU stacks that support it, with eager implementations as the
+portable fallback.
+
+On Windows, Triton is registered but disabled by default because its JIT
+compiler/runtime is not part of the validated XPU Portable path. Dispatch uses
+the XPU backend first and then eager. An advanced environment with a working
+Windows Triton toolchain can opt in explicitly:
+
+```python
+import comfy_kitchen as ck
+
+ck.enable_backend("triton")
+```
 
 Check the active runtime explicitly:
 

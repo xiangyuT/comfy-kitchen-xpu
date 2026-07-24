@@ -26,6 +26,8 @@ class TestBackendSystem:
         # Eager backend should always be available
         assert backends["eager"]["available"] is True
         assert "capabilities" in backends["eager"]
+        if sys.platform == "win32":
+            assert backends["triton"]["disabled"] is True
 
     def test_backend_priority(self):
         import comfy_kitchen as ck
@@ -52,15 +54,18 @@ class TestBackendSystem:
     def test_disable_enable_backend(self):
         import comfy_kitchen as ck
 
-        # Disable triton
-        ck.disable_backend("triton")
-        backends = ck.list_backends()
-        assert backends["triton"]["disabled"] is True
+        originally_disabled = ck.list_backends()["triton"]["disabled"]
+        try:
+            ck.disable_backend("triton")
+            assert ck.list_backends()["triton"]["disabled"] is True
 
-        # Re-enable
-        ck.enable_backend("triton")
-        backends = ck.list_backends()
-        assert backends["triton"]["disabled"] is False
+            ck.enable_backend("triton")
+            assert ck.list_backends()["triton"]["disabled"] is False
+        finally:
+            if originally_disabled:
+                ck.disable_backend("triton")
+            else:
+                ck.enable_backend("triton")
 
     def test_int8_capabilities_listed(self):
         """Test that int8 operations are listed in backend capabilities."""
