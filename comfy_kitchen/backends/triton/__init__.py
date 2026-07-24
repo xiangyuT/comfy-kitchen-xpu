@@ -15,6 +15,9 @@ __all__ = [
 ]
 
 # Try to import triton and register if available
+import os
+import sys
+
 import torch
 
 from comfy_kitchen.constraints import (
@@ -26,6 +29,12 @@ from comfy_kitchen.registry import registry
 
 _TRITON_AVAILABLE = True
 _TRITON_ERROR = None
+_WINDOWS_TRITON_ENV = "COMFY_KITCHEN_ENABLE_TRITON_WINDOWS"
+
+
+def _windows_triton_opted_in() -> bool:
+    value = os.environ.get(_WINDOWS_TRITON_ENV, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 try:
     import triton  # noqa: F401
@@ -210,6 +219,14 @@ def _build_constraints() -> dict:
 
 
 def _register():
+    if sys.platform == "win32" and not _windows_triton_opted_in():
+        registry.mark_unavailable(
+            "triton",
+            "Triton is unavailable by default on Windows; "
+            f"set {_WINDOWS_TRITON_ENV}=1 before importing comfy_kitchen to enable it",
+        )
+        return
+
     if not _TRITON_AVAILABLE:
         registry.mark_unavailable("triton", _TRITON_ERROR or "Triton not available")
         return

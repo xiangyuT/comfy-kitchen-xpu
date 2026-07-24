@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 
@@ -26,6 +27,44 @@ class TestBackendSystem:
         # Eager backend should always be available
         assert backends["eager"]["available"] is True
         assert "capabilities" in backends["eager"]
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows Triton policy")
+    def test_triton_is_unavailable_by_default_on_windows(self):
+        env_name = "COMFY_KITCHEN_ENABLE_TRITON_WINDOWS"
+        env = os.environ.copy()
+        env.pop(env_name, None)
+
+        default_script = f"""
+import comfy_kitchen as ck
+status = ck.list_backends()["triton"]
+assert status["available"] is False, status
+assert status["disabled"] is False, status
+assert "{env_name}=1" in status["unavailable_reason"], status
+"""
+        default_result = subprocess.run(
+            [sys.executable, "-c", default_script],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert default_result.returncode == 0, default_result.stderr
+
+        env[env_name] = "1"
+        opt_in_script = f"""
+import comfy_kitchen as ck
+status = ck.list_backends()["triton"]
+reason = status["unavailable_reason"] or ""
+assert "{env_name}=1" not in reason, status
+"""
+        opt_in_result = subprocess.run(
+            [sys.executable, "-c", opt_in_script],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert opt_in_result.returncode == 0, opt_in_result.stderr
 
     def test_backend_priority(self):
         import comfy_kitchen as ck
