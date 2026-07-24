@@ -1,7 +1,6 @@
 import torch
 
 from ._version import __version__
-from .backends import cuda as _cuda_backend  # noqa: F401
 
 # Import backends to trigger auto-registration
 from .backends import eager as _eager_backend  # noqa: F401
@@ -574,7 +573,7 @@ def set_backend_priority(priority: list[str]) -> None:
 
     Args:
         priority: List of backend names in order of preference
-                 Example: ["cuda", "eager"] to prefer CUDA over Torch
+                 Example: ["xpu", "triton", "eager"]
     """
     registry.set_priority(priority)
 
@@ -583,7 +582,7 @@ def disable_backend(name: str) -> None:
     """Disable a backend, preventing its use.
 
     Args:
-        name: Backend name to disable ("eager", "cuda", or "triton")
+        name: Backend name to disable ("xpu", "triton", or "eager")
     """
     registry.disable(name)
 
@@ -592,7 +591,7 @@ def enable_backend(name: str) -> None:
     """Re-enable a previously disabled backend.
 
     Args:
-        name: Backend name to enable ("eager", "cuda", or "triton")
+        name: Backend name to enable ("xpu", "triton", or "eager")
     """
     registry.enable(name)
 

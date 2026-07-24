@@ -20,7 +20,6 @@ class TestBackendSystem:
 
         assert isinstance(backends, dict)
         assert "eager" in backends
-        assert "cuda" in backends
         assert "xpu" in backends
         assert "triton" in backends
 
@@ -33,8 +32,9 @@ class TestBackendSystem:
 
         original = list(ck.registry._priority)
         try:
-            ck.set_backend_priority(["eager", "cuda", "xpu", "triton"])
-            ck.set_backend_priority(["cuda", "xpu", "triton", "eager"])
+            assert original == ["xpu", "triton", "eager"]
+            ck.set_backend_priority(["eager", "xpu", "triton"])
+            ck.set_backend_priority(["xpu", "triton", "eager"])
         finally:
             ck.set_backend_priority(original)
 
@@ -75,8 +75,9 @@ class TestBackendSystem:
         assert "quantize_int8_rowwise" in eager_caps
         assert "dequantize_int8_simple" in eager_caps
 
-        # Check cuda (if available)
-        if backends["cuda"]["available"]:
+        # CUDA source remains in the repository for upstream synchronization,
+        # but the XPU wheel does not import or package it.
+        if backends.get("cuda", {}).get("available", False):
             cuda_caps = backends["cuda"]["capabilities"]
             assert "int8_linear" in cuda_caps
 
@@ -110,6 +111,20 @@ import comfy_kitchen as ck
 status = ck.list_backends()['xpu']
 assert status['available'] is False
 assert status['unavailable_reason']
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_clean_import_does_not_register_cuda(self):
+        script = """
+import comfy_kitchen as ck
+assert ck.registry._priority == ['xpu', 'triton', 'eager']
+assert 'cuda' not in ck.list_backends()
 """
         result = subprocess.run(
             [sys.executable, "-c", script],

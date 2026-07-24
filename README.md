@@ -60,7 +60,7 @@ backend registers all 24 capabilities in its current target set.
 Backend priority is:
 
 ```text
-cuda -> xpu -> triton -> eager
+xpu -> triton -> eager
 ```
 
 The XPU backend becomes available only when:
@@ -71,8 +71,8 @@ The XPU backend becomes available only when:
 
 Optional SVDQuant, normalization, FP8, RoPE, and ConvRot capability groups are
 detected separately. A partial or older native package therefore advertises
-only the operations it actually implements. If XPU is unavailable, normal
-upstream eager/CUDA/Triton behavior remains unchanged.
+only the operations it actually implements. Triton remains available on XPU
+stacks that support it, with eager implementations as the portable fallback.
 
 Check the active runtime explicitly:
 
@@ -111,9 +111,15 @@ in `omni_xpu_kernel`.
 git clone --branch dev/ptl-h-kitchen-xpu \
     https://github.com/xiangyuT/comfy-kitchen-xpu.git
 cd comfy-kitchen-xpu
-python setup.py bdist_wheel --no-cuda
+python -m pip install build
+python -m build --wheel
 pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.18-py3-none-any.whl
 ```
+
+The repository retains upstream CUDA source to keep future upstream updates
+reviewable. The XPU wheel does not probe for CUDA, compile the CUDA extension,
+or package `comfy_kitchen.backends.cuda`; it contains the XPU, Triton, and eager
+Python backends only.
 
 ### Build the target-specific companion wheel
 
