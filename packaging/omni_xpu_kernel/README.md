@@ -2,8 +2,9 @@
 
 Comfy Kitchen owns the build, validation, and release flow for the
 `omni_xpu_kernel` wheels used by its optional XPU backend. The native Kernel
-source remains in the llm-scaler repository; it is not copied into the pure
-Python `comfy-kitchen` wheel.
+source remains in Intel's
+[`llm-scaler`](https://github.com/intel/llm-scaler) repository; it is not
+copied into the pure-Python `comfy-kitchen` wheel.
 
 This separation is intentional:
 
@@ -55,55 +56,24 @@ and Python bytecode are excluded so a shared llm-scaler checkout cannot leak
 stale artifacts into a companion wheel. Set `KEEP_BUILD_TREES=1` only when the
 staged source and compiler output are needed for diagnosis.
 
-## PTL-H development status
+## Artifact identity and validation
 
-The PTL-H profile is maintained on `dev/ptl-h-kitchen-xpu`. Its initial
-llm-scaler source checkpoint is
-`dfc364da1f77ea6ea102df13f3177af9b36b4b81`; the expected wheel identity ends
-in `+torch211.ptlh`. CUTLASS-SYCL is pinned to
-`525faea3f0f43a8aec2d21a70d44111db639a3a9`. The clean-install smoke test
-rejects stale bytecode, a mismatched Torch
-minor, package target, version tag, or native core AOT target before exercising
-the required native APIs and CUTE attention.
+The companion artifacts are CPython-specific `linux_x86_64` wheels, not
+`abi3` or manylinux wheels. They are also specific to the PyTorch ABI and GPU
+AOT target. A BMG wheel must not be reused on PTL-H, or vice versa.
 
-The Python 3.12 wheel from the pinned tuple passed filtered-source build,
-clean-install, Kernel/Kitchen tests, and 1024 x 1024 Boogu/Krea2/Boogu ComfyUI
-workflow switching on PTL-H. Python 3.10, 3.11, 3.13, and 3.14 remain matrix
-jobs rather than accepted local artifacts. The complete phase boundary is in
-[`docs/PTL_H_MAINTENANCE.md`](../../docs/PTL_H_MAINTENANCE.md).
+For each release candidate:
 
-## Historical BMG artifact status
+1. Pin the Intel `llm-scaler` and CUTLASS-SYCL source revisions.
+2. Set `OMNI_XPU_DEVICE`, `TORCH_SPEC`, `EXPECTED_TORCH_MINOR`, and
+   `EXPECTED_XPU_TARGET` explicitly.
+3. Build from the filtered source copy and install the result into a clean
+   environment with the matching PyTorch XPU runtime.
+4. Verify the package target, version tag, loaded core AOT target, required
+   native capabilities, LGRF sidecar, and a real BF16 CUTE attention call.
+5. Run the Kernel and Kitchen correctness suites plus representative ComfyUI
+   workflows on the target device before publishing.
 
-The following table is retained from the original BMG integration. It is not a
-PTL-H artifact list and none of its wheels may be reused for PTL-H. CUTE became
-a required Kitchen artifact on 2026-07-13; that BMG matrix rebuild was deferred
-until its project milestone:
-
-Current llm-scaler source is versioned `0.1.0-b8-dev`; its wheel metadata and
-filename use the PEP 440-normalized `0.1.0b8.dev0`. The artifacts below predate
-that version alignment and must not be published as b8 wheels.
-
-| Python | Interpreter | Current status | Wheel bytes | SHA-256 |
-|---|---|---|---:|---|
-| 3.10 | 3.10.20 | pending milestone rebuild | — | — |
-| 3.11 | 3.11.15 | legacy, quarantined: missing cute | 908771 | `a4ae12974fa68024036bc3ed38949fd097dce4f18241f103c3015854975b2057` |
-| 3.12 | 3.12.13 | accepted with cute | 1015302 | `3fb88eb72532f207d7974ef6a927865de2dfd79c4f8adfd02c95a23eecc7ef7a` |
-| 3.13 | 3.13.14 | legacy, quarantined: missing cute | 911267 | `48732d04300a02c93d929ac55b5472dba76d33f356bbc11fc2acd37cdbe2c25d` |
-| 3.14 | 3.14.6 | legacy, quarantined: missing cute | 911402 | `b0013da8b99e221425a80ddd5db74169e6ce06c46eb12fa4763d37f36db604ea` |
-
-An accepted wheel must contain and load the ABI-specific
-`cute/cute_fmha_torch` extension. Clean-install smoke runs a real BF16 cute
-attention call in addition to native extension loading, XPU availability, and
-required FP8, RoPE, INT8, ConvRot, AdaLN, and unsigned-SVDQuant symbol checks.
-It also verifies that the current cute Kernel rejects cross-attention rather
-than returning an unvalidated result.
-
-Only the historically accepted BMG cp312 wheel is kept at the top level of
-`wheelhouse/omni_xpu_kernel/`. Old wheels that predate the cute requirement are
-under `legacy-no-cute/` so release globs cannot select them. Wheel hashes are
-artifact identifiers, not reproducible-build guarantees; rebuilding can
-change ZIP metadata.
-
-These artifacts are CPython-specific `linux_x86_64` wheels, not `abi3` or
-manylinux wheels. A release must pin the llm-scaler source revision and state
-the required PyTorch XPU, oneAPI runtime, and target GPU.
+Wheel hashes identify a particular artifact but do not guarantee reproducible
+ZIP bytes. Release notes must record the source revisions, wheel hash, Python
+and PyTorch versions, oneAPI/oneDNN runtime requirements, and target GPU.

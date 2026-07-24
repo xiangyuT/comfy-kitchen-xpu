@@ -3,7 +3,7 @@
 Intel XPU integration for
 [Comfy-Org/comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen), backed
 by the optional
-[`omni_xpu_kernel`](https://github.com/xiangyuT/llm-scaler/tree/main/omni/omni_xpu_kernel)
+[`omni_xpu_kernel`](https://github.com/intel/llm-scaler/tree/main/omni/omni_xpu_kernel)
 native package.
 
 This repository keeps Comfy Kitchen's public APIs and backend dispatch model,
@@ -29,6 +29,12 @@ The Intel-specific work in this fork is intentionally optional: importing
 Comfy Kitchen remains safe when PyTorch XPU, `omni_xpu_kernel`, its native
 extension, or Intel GPU hardware is absent.
 
+The native XPU implementation comes from Intel's
+[`llm-scaler`](https://github.com/intel/llm-scaler) project. We also thank its
+maintainers and contributors; this repository provides the Comfy Kitchen
+adapter and companion-wheel integration rather than redefining ownership of
+that native project.
+
 The original upstream CUDA and generic-backend README is retained
 [at the bottom of this page](#upstream-readme-reference) for reference.
 
@@ -44,13 +50,10 @@ The original upstream CUDA and generic-backend README is retained
 - Target-checked companion-wheel construction for BMG and PTL-H, including
   Torch ABI, package target, core AOT target, LGRF, CUTE, and clean-install
   validation.
-- XPU operator tests, portable tensor tests, self-hosted device workflows, and
-  recoverable implementation/acceptance documentation.
+- XPU operator tests, portable tensor tests, and self-hosted device workflows.
 
 Excluding the explicitly deferred NVFP4, MXFP8, and AWQ formats, the XPU
-backend registers all 24 capabilities in its current target set. The detailed
-operator matrix and implementation notes are in
-[`docs/XPU_BACKEND_STATUS.md`](docs/XPU_BACKEND_STATUS.md).
+backend registers all 24 capabilities in its current target set.
 
 ## XPU backend behavior
 
@@ -139,11 +142,11 @@ for the artifact matrix and clean-install checks.
 
 ### Docker image integration
 
-The focused ComfyUI image pins the Kitchen commit and builds the two wheel
-branches independently:
+The ComfyUI image build uses the Intel upstream repository and compiles the
+target-specific native wheel for the selected GPU:
 
 ```bash
-git clone https://github.com/xiangyuT/llm-scaler.git
+git clone https://github.com/intel/llm-scaler.git
 cd llm-scaler/omni
 
 # On the matching host:
@@ -156,26 +159,12 @@ The Docker build produces the same pure-Python Kitchen layer but recompiles
 `omni_xpu_kernel` for the selected target. Image labels record the Kitchen
 revision/version and XPU target.
 
-## Repository documentation
-
-- [`docs/XPU_BACKEND_STATUS.md`](docs/XPU_BACKEND_STATUS.md): implementation,
-  operator coverage, BMG history, tests, and follow-up work.
-- [`docs/PTL_H_MAINTENANCE.md`](docs/PTL_H_MAINTENANCE.md): PTL-H ownership,
-  pinned tuple, accepted artifacts, and acceptance results.
-- [`docs/XPU_TENSOR_TEST_MIGRATION.md`](docs/XPU_TENSOR_TEST_MIGRATION.md):
-  portable QuantizedTensor test coverage.
-- [`packaging/omni_xpu_kernel/README.md`](packaging/omni_xpu_kernel/README.md):
-  target-specific companion-wheel build and artifact rules.
-
 ## Current limitations
 
 - Intel XPU support remains experimental and is not an upstream Comfy Kitchen
   release claim.
 - NVFP4, MXFP8, and AWQ are explicitly deferred for XPU.
 - Native wheels are CPython-, Torch-ABI-, and target-specific.
-- The currently accepted local artifact is Python 3.12; other Python versions
-  remain build-matrix jobs until their complete target-specific acceptance is
-  recorded.
 - BMG and PTL-H performance numbers are not portable across devices.
 - Full-image measurements include changes outside Kitchen and cannot establish
   an isolated Kitchen speedup.
