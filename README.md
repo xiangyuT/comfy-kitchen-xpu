@@ -25,6 +25,8 @@ implementations, packaging, and tests on which this work is built.
 
 The XPU development line is based on upstream Comfy Kitchen `0.2.18` at
 [`898017e`](https://github.com/Comfy-Org/comfy-kitchen/commit/898017e5c0f23b5b7b9a8473746be6c419baffb3).
+Its wheel version is `0.2.18+xpu.1`, which preserves the upstream public
+version while giving the XPU-specific artifact an unambiguous identity.
 The Intel-specific work in this fork is intentionally optional: importing
 Comfy Kitchen remains safe when PyTorch XPU, `omni_xpu_kernel`, its native
 extension, or Intel GPU hardware is absent.
@@ -113,7 +115,7 @@ git clone --branch dev/ptl-h-kitchen-xpu \
 cd comfy-kitchen-xpu
 python -m pip install build
 python -m build --wheel
-pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.18-py3-none-any.whl
+pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.18+xpu.1-py3-none-any.whl
 ```
 
 The repository retains upstream CUDA source to keep future upstream updates

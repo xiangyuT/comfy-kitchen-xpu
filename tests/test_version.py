@@ -14,3 +14,7 @@ def test_source_version_matches_project_metadata():
 
     assert match is not None
     assert comfy_kitchen.__version__ == match.group(1)
+
+
+def test_xpu_wheel_has_distinct_local_version():
+    assert comfy_kitchen.__version__ == "0.2.18+xpu.1"
