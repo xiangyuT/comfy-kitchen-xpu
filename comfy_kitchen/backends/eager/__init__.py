@@ -12,6 +12,7 @@ __all__ = [
     "dequantize_int8_convrot_weight",
     "dequantize_int8_convrot_weight_dtype",
     "dequantize_convrot_w4a4_weight",
+    "dequantize_gguf",
     "gemv_awq_w4a16",
     "convrot_w4a4_linear",
     "prepare_int4_weight_for_int8_linear",
@@ -49,6 +50,7 @@ from .convrot_w4a4 import (
     prepare_int4_weight_for_int8_linear,
     quantize_convrot_w4a4_weight,
 )
+from .gguf import dequantize_gguf
 from .quantization import (
     dequantize_int8_convrot_weight,
     dequantize_int8_convrot_weight_dtype,
@@ -139,6 +141,15 @@ def _build_constraints() -> dict:
                     dtypes=frozenset({torch.float8_e4m3fn}),
                 ),
                 "output_type": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        "dequantize_gguf": FunctionConstraints(
+            params={
+                "data": ParamConstraint(dtypes=frozenset({torch.uint8})),
+                "quant_type_code": ParamConstraint(dtypes=frozenset({int})),
+                "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
+                "layout_code": ParamConstraint(dtypes=frozenset({int})),
             },
             default_devices=all_devices,
         ),

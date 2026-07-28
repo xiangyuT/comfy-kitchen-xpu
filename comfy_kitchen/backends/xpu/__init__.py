@@ -17,6 +17,7 @@ __all__ = [
     "apply_rope_split_half1",
     "convrot_w4a4_linear",
     "dequantize_convrot_w4a4_weight",
+    "dequantize_gguf",
     "dequantize_per_tensor_fp8",
     "dequantize_int8_convrot_weight",
     "dequantize_int8_convrot_weight_dtype",
@@ -39,12 +40,15 @@ __all__ = [
 _AVAILABLE = False
 _ERROR = None
 _NATIVE_CAPABILITIES = frozenset()
+_INT8_AVAILABLE = False
+_INT8_ERROR = None
 _SVDQ_AVAILABLE = False
 _NORM_AVAILABLE = False
 _FP8_AVAILABLE = False
 _FP8_QDQ_AVAILABLE = False
 _ROPE_AVAILABLE = False
 _CONVROT_NATIVE_AVAILABLE = False
+_GGUF_AVAILABLE = False
 
 _REQUIRED_NATIVE_INT8_OPS = frozenset(
     {
@@ -66,63 +70,89 @@ try:
     elif not omni_xpu_kernel.is_available():
         _ERROR = "omni_xpu_kernel native extension is not available"
     else:
-        _native_int8 = omni_xpu_kernel._load_extension().int8
+        _extension = omni_xpu_kernel._load_extension()
+        _AVAILABLE = True
+        _native_int8 = getattr(_extension, "int8", None)
         _NATIVE_CAPABILITIES = frozenset(
-            name for name in _REQUIRED_NATIVE_INT8_OPS if hasattr(_native_int8, name)
+            name
+            for name in _REQUIRED_NATIVE_INT8_OPS
+            if _native_int8 is not None and hasattr(_native_int8, name)
         )
         missing = _REQUIRED_NATIVE_INT8_OPS - _NATIVE_CAPABILITIES
         if missing:
-            _ERROR = "omni_xpu_kernel INT8 extension is missing: " + ", ".join(sorted(missing))
+            _INT8_ERROR = "omni_xpu_kernel INT8 extension is missing: " + ", ".join(
+                sorted(missing)
+            )
         else:
-            _AVAILABLE = True
-            _native_svdq = omni_xpu_kernel._load_extension().svdq
-            _SVDQ_AVAILABLE = all(
-                hasattr(_native_svdq, name)
-                for name in ("dequantize_svdq_w4", "quantize_svdq_act_int4", "onednn_int4_gemm")
+            _INT8_AVAILABLE = True
+
+        _native_svdq = getattr(_extension, "svdq", None)
+        _SVDQ_AVAILABLE = _native_svdq is not None and all(
+            hasattr(_native_svdq, name)
+            for name in (
+                "dequantize_svdq_w4",
+                "quantize_svdq_act_int4",
+                "onednn_int4_gemm",
             )
-            _native_norm = omni_xpu_kernel._load_extension().norm
-            _NORM_AVAILABLE = hasattr(_native_norm, "layer_norm")
-            _native_linear = omni_xpu_kernel._load_extension().linear
-            _FP8_AVAILABLE = hasattr(_native_linear, "onednn_w8a16_fp8")
-            _native_fp8 = getattr(omni_xpu_kernel._load_extension(), "fp8", None)
-            _FP8_QDQ_AVAILABLE = _native_fp8 is not None and all(
-                hasattr(_native_fp8, name)
-                for name in (
-                    "dequantize_per_tensor",
-                    "quantize_per_tensor",
-                    "stochastic_rounding",
-                )
+        )
+        _native_norm = getattr(_extension, "norm", None)
+        _NORM_AVAILABLE = _native_norm is not None and hasattr(
+            _native_norm, "layer_norm"
+        )
+        _native_linear = getattr(_extension, "linear", None)
+        _FP8_AVAILABLE = _native_linear is not None and hasattr(
+            _native_linear, "onednn_w8a16_fp8"
+        )
+        _native_fp8 = getattr(_extension, "fp8", None)
+        _FP8_QDQ_AVAILABLE = _native_fp8 is not None and all(
+            hasattr(_native_fp8, name)
+            for name in (
+                "dequantize_per_tensor",
+                "quantize_per_tensor",
+                "stochastic_rounding",
             )
-            _native_rotary = omni_xpu_kernel._load_extension().rotary
-            _ROPE_AVAILABLE = all(
-                hasattr(_native_rotary, name)
-                for name in (
-                    "apply_kitchen_rope",
-                    "apply_kitchen_rope1",
-                    "apply_kitchen_rope_split_half",
-                    "apply_kitchen_rope_split_half1",
-                )
+        )
+        _native_rotary = getattr(_extension, "rotary", None)
+        _ROPE_AVAILABLE = _native_rotary is not None and all(
+            hasattr(_native_rotary, name)
+            for name in (
+                "apply_kitchen_rope",
+                "apply_kitchen_rope1",
+                "apply_kitchen_rope_split_half",
+                "apply_kitchen_rope_split_half1",
             )
-            _CONVROT_NATIVE_AVAILABLE = all(
-                hasattr(_native_int8, name)
-                for name in (
-                    "dequantize_int8_convrot_weight",
-                    "quantize_int8_convrot_weight",
-                    "rotate_convrot",
-                )
+        )
+        _CONVROT_NATIVE_AVAILABLE = _native_int8 is not None and all(
+            hasattr(_native_int8, name)
+            for name in (
+                "dequantize_int8_convrot_weight",
+                "quantize_int8_convrot_weight",
+                "rotate_convrot",
             )
+        )
+        _native_gguf = getattr(_extension, "gguf", None)
+        _GGUF_AVAILABLE = _native_gguf is not None and all(
+            hasattr(_native_gguf, name)
+            for name in (
+                "dequantize_q4_0",
+                "dequantize_q8_0",
+                "dequantize_q4_k",
+                "dequantize_q6_k",
+            )
+        )
 except (ImportError, OSError, RuntimeError) as exc:
     _ERROR = f"{type(exc).__name__}: {exc}"
 
 
 if _AVAILABLE:
-    quantize_int8_tensorwise = _int8.quantize_int8_tensorwise
-    quantize_int8_rowwise = _int8.quantize_int8_rowwise
-    dequantize_int8_simple = _int8.dequantize_int8_simple
-    int8_linear = _int8.int8_linear
-    mm_int8 = _int8.mm_int8
-    quantize_int8_convrot_weight = _int8.quantize_int8_convrot_weight
-    dequantize_int8_convrot_weight = _int8.dequantize_int8_convrot_weight
+    if _INT8_AVAILABLE:
+        quantize_int8_tensorwise = _int8.quantize_int8_tensorwise
+        quantize_int8_rowwise = _int8.quantize_int8_rowwise
+        dequantize_int8_simple = _int8.dequantize_int8_simple
+        int8_linear = _int8.int8_linear
+        mm_int8 = _int8.mm_int8
+        quantize_int8_convrot_weight = _int8.quantize_int8_convrot_weight
+        dequantize_int8_convrot_weight = _int8.dequantize_int8_convrot_weight
 
     if _NORM_AVAILABLE:
         from .adaln import adaln
@@ -149,25 +179,30 @@ if _AVAILABLE:
             quantize_convrot_w4a4_weight,
         )
 
-    def dequantize_int8_simple_dtype(
-        q: torch.Tensor,
-        scale: torch.Tensor,
-        output_dtype_code: int,
-    ) -> torch.Tensor:
-        """Adapt Kitchen's dtype-code ABI to omni's torch.dtype API."""
-        out_dtype = _CODE_TO_DTYPE[output_dtype_code]
-        return _int8.dequantize_int8_simple_dtype(q, scale, out_dtype)
+    if _GGUF_AVAILABLE:
+        from .gguf import dequantize_gguf
 
-    def dequantize_int8_convrot_weight_dtype(
-        q: torch.Tensor,
-        scale: torch.Tensor,
-        group_size: int,
-        output_dtype_code: int,
-    ) -> torch.Tensor:
-        """Dequantize ConvRot weights and convert to the requested Kitchen dtype."""
-        return _int8.dequantize_int8_convrot_weight(q, scale, group_size).to(
-            _CODE_TO_DTYPE[output_dtype_code]
-        )
+    if _INT8_AVAILABLE:
+
+        def dequantize_int8_simple_dtype(
+            q: torch.Tensor,
+            scale: torch.Tensor,
+            output_dtype_code: int,
+        ) -> torch.Tensor:
+            """Adapt Kitchen's dtype-code ABI to omni's torch.dtype API."""
+            out_dtype = _CODE_TO_DTYPE[output_dtype_code]
+            return _int8.dequantize_int8_simple_dtype(q, scale, out_dtype)
+
+        def dequantize_int8_convrot_weight_dtype(
+            q: torch.Tensor,
+            scale: torch.Tensor,
+            group_size: int,
+            output_dtype_code: int,
+        ) -> torch.Tensor:
+            """Dequantize ConvRot weights and convert to the requested Kitchen dtype."""
+            return _int8.dequantize_int8_convrot_weight(
+                q, scale, group_size
+            ).to(_CODE_TO_DTYPE[output_dtype_code])
 
 
 _CODE_TO_DTYPE = {
@@ -255,6 +290,8 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
             default_devices=xpu,
         ),
     }
+    if not _INT8_AVAILABLE:
+        capabilities.clear()
     if _SVDQ_AVAILABLE:
         capabilities.update(
             {
@@ -326,6 +363,16 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
                     default_devices=xpu,
                 ),
             }
+        )
+    if _GGUF_AVAILABLE:
+        capabilities["dequantize_gguf"] = FunctionConstraints(
+            params={
+                "data": ParamConstraint(dtypes=frozenset({torch.uint8})),
+                "quant_type_code": ParamConstraint(dtypes=frozenset({int})),
+                "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
+                "layout_code": ParamConstraint(dtypes=frozenset({int})),
+            },
+            default_devices=xpu,
         )
     if _ROPE_AVAILABLE:
         rope_input = ParamConstraint(dtypes=floats, shape_rules=(ExactDims(4),))
@@ -414,10 +461,17 @@ def _register() -> None:
     if not _AVAILABLE:
         registry.mark_unavailable("xpu", _ERROR or "omni_xpu_kernel is not available")
         return
+    capabilities = _build_constraints()
+    if not capabilities:
+        registry.mark_unavailable(
+            "xpu",
+            _INT8_ERROR or "omni_xpu_kernel exposes no supported Kitchen capabilities",
+        )
+        return
     registry.register(
         name="xpu",
         module=sys.modules[__name__],
-        capabilities=_build_constraints(),
+        capabilities=capabilities,
     )
 
 

@@ -14,6 +14,7 @@ from .exceptions import (
     NoCapableBackendError,
 )
 from .float_utils import from_blocked, swap_nibbles, to_blocked
+from .gguf import dequantize_gguf, get_gguf_route_diagnostics
 
 # Import registry and exceptions
 from .registry import registry
@@ -39,6 +40,8 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_int8_tensorwise",
     "dequantize_int8_simple",
+    "dequantize_gguf",
+    "get_gguf_route_diagnostics",
     # Fused matmul
     "scaled_mm_nvfp4",
     "scaled_mm_mxfp8",

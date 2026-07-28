@@ -124,14 +124,17 @@ assert "{env_name}=1" not in reason, status
             from comfy_kitchen.backends import xpu
 
             xpu_caps = backends["xpu"]["capabilities"]
-            assert "int8_linear" in xpu_caps
-            assert "mm_int8" in xpu_caps
-            assert "quantize_int8_tensorwise" in xpu_caps
+            if xpu._INT8_AVAILABLE:
+                assert "int8_linear" in xpu_caps
+                assert "mm_int8" in xpu_caps
+                assert "quantize_int8_tensorwise" in xpu_caps
             if xpu._SVDQ_AVAILABLE:
                 assert "quantize_svdquant_w4a4" in xpu_caps
                 assert "scaled_mm_svdquant_w4a4" in xpu_caps
             if xpu._NORM_AVAILABLE:
                 assert "adaln" in xpu_caps
+            if xpu._GGUF_AVAILABLE:
+                assert "dequantize_gguf" in xpu_caps
 
     def test_xpu_backend_is_optional(self):
         """Missing XPU hardware or omni extension must not break package import."""
@@ -159,6 +162,41 @@ assert status['unavailable_reason']
         )
         assert result.returncode == 0, result.stderr
 
+    def test_gguf_capability_does_not_require_int8_symbols(self):
+        script = """
+import sys
+import types
+import torch
+
+names = ('dequantize_q4_0', 'dequantize_q8_0', 'dequantize_q4_k', 'dequantize_q6_k')
+fake_gguf = types.SimpleNamespace(**{name: (lambda *args, **kwargs: None) for name in names})
+fake_native = types.SimpleNamespace(gguf=fake_gguf)
+fake_omni = types.ModuleType('omni_xpu_kernel')
+fake_omni.int8 = types.SimpleNamespace()
+fake_omni.gguf = fake_gguf
+fake_omni.is_available = lambda: True
+fake_omni._load_extension = lambda: fake_native
+sys.modules['omni_xpu_kernel'] = fake_omni
+torch.xpu.is_available = lambda: True
+
+import comfy_kitchen as ck
+from comfy_kitchen.backends import xpu
+
+status = ck.list_backends()['xpu']
+assert status['available'] is True, status
+assert xpu._INT8_AVAILABLE is False
+assert xpu._GGUF_AVAILABLE is True
+assert 'dequantize_gguf' in status['capabilities']
+assert 'int8_linear' not in status['capabilities']
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+
     def test_clean_import_does_not_register_cuda(self):
         script = """
 import comfy_kitchen as ck
@@ -177,8 +215,10 @@ assert 'cuda' not in ck.list_backends()
         from comfy_kitchen.backends.xpu import _build_constraints
 
         constraints = _build_constraints()
-        assert constraints["int8_linear"].default_devices == frozenset({"xpu"})
-        assert constraints["mm_int8"].default_devices == frozenset({"xpu"})
+        assert all(
+            constraint.default_devices == frozenset({"xpu"})
+            for constraint in constraints.values()
+        )
 
     def test_available_xpu_backend_has_native_core(self):
         from comfy_kitchen.backends import xpu
@@ -186,7 +226,8 @@ assert 'cuda' not in ck.list_backends()
         if not ck.list_backends()["xpu"]["available"]:
             pytest.skip("omni XPU backend is unavailable")
 
-        assert xpu._NATIVE_CAPABILITIES == xpu._REQUIRED_NATIVE_INT8_OPS
+        if xpu._INT8_AVAILABLE:
+            assert xpu._NATIVE_CAPABILITIES == xpu._REQUIRED_NATIVE_INT8_OPS
 
     def test_backend_context_manager_override(self, small_tensor):
         """Test that use_backend context manager correctly overrides backend selection."""
