@@ -31,6 +31,7 @@ class PreparedSVDQuantW4A16:
     rcp_smooth_f16: torch.Tensor | None
     source_qweight: torch.Tensor
     source_wscales: torch.Tensor
+    source_smooth: torch.Tensor | None
     destructive: bool
     group_size: int
     in_features: int
@@ -151,24 +152,28 @@ def prepare_svdquant_w4a16_for_xpu(
             "preparing again"
         )
 
-    if destructive:
-        packed_u4 = qweight.view(torch.uint8)
-        packed_u4.bitwise_xor_(0x88)
-        qweight._comfy_kitchen_w4a16_prepared = True
-    else:
-        packed_u4 = (qweight.view(torch.uint8) ^ 0x88).contiguous()
+    # Allocate all derived small tensors before destructively changing the
+    # full weight. If preparation runs out of memory, the model parameter
+    # remains in its checkpoint representation and is safe to retry.
     scales_f16 = wscales.to(torch.float16).contiguous()
     rcp_smooth_f16 = (
         (1.0 / smooth.float()).to(torch.float16).contiguous()
         if smooth is not None
         else None
     )
+    if destructive:
+        packed_u4 = qweight.view(torch.uint8)
+        packed_u4.bitwise_xor_(0x88)
+        qweight._comfy_kitchen_w4a16_prepared = True
+    else:
+        packed_u4 = (qweight.view(torch.uint8) ^ 0x88).contiguous()
     return PreparedSVDQuantW4A16(
         packed_u4=packed_u4,
         scales_f16=scales_f16,
         rcp_smooth_f16=rcp_smooth_f16,
         source_qweight=qweight,
         source_wscales=wscales,
+        source_smooth=smooth,
         destructive=destructive,
         group_size=_GROUP_SIZE,
         in_features=in_features,
