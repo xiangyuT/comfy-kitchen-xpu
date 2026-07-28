@@ -145,6 +145,7 @@ try:
             hasattr(_native_gguf, name)
             for name in (
                 "dequantize_q4_0",
+                "dequantize_q4_1",
                 "dequantize_q8_0",
                 "dequantize_q4_k",
                 "dequantize_q6_k",

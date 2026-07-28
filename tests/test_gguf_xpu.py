@@ -25,6 +25,7 @@ pytestmark = pytest.mark.skipif(
 
 BLOCK_BYTES = {
     "q4_0": 18,
+    "q4_1": 20,
     "q8_0": 34,
     "q4_k": 144,
     "q6_k": 210,
@@ -47,6 +48,9 @@ def _make_blocks(quant_type: str, count: int = 37) -> torch.Tensor:
     for index in range(count):
         if quant_type in {"q4_0", "q8_0"}:
             blocks[index, :2] = _half_bytes(0.125 * (1 + index % 4))
+        elif quant_type == "q4_1":
+            blocks[index, :2] = _half_bytes(0.125 * (1 + index % 4))
+            blocks[index, 2:4] = _half_bytes(-0.25 * (1 + index % 4))
         elif quant_type == "q4_k":
             blocks[index, :2] = _half_bytes(0.03125 * (1 + index % 4))
             blocks[index, 2:4] = _half_bytes(0.015625 * (1 + index % 4))
@@ -63,7 +67,7 @@ def _direct_omni(data, quant_type, dtype, layout):
     return getattr(gguf, f"dequantize_{quant_type}")(data, dtype)
 
 
-@pytest.mark.parametrize("quant_type", ["q4_0", "q8_0", "q4_k", "q6_k"])
+@pytest.mark.parametrize("quant_type", ["q4_0", "q4_1", "q8_0", "q4_k", "q6_k"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_xpu_matches_eager_and_direct_omni(quant_type, dtype):
     data = _make_blocks(quant_type)

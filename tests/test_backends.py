@@ -168,7 +168,13 @@ import sys
 import types
 import torch
 
-names = ('dequantize_q4_0', 'dequantize_q8_0', 'dequantize_q4_k', 'dequantize_q6_k')
+names = (
+    'dequantize_q4_0',
+    'dequantize_q4_1',
+    'dequantize_q8_0',
+    'dequantize_q4_k',
+    'dequantize_q6_k',
+)
 fake_gguf = types.SimpleNamespace(**{name: (lambda *args, **kwargs: None) for name in names})
 fake_native = types.SimpleNamespace(gguf=fake_gguf)
 fake_omni = types.ModuleType('omni_xpu_kernel')

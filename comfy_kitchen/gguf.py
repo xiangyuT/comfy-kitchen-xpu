@@ -13,6 +13,7 @@ GGUF_QUANT_TYPE_TO_CODE: Final = {
     "q8_0": 1,
     "q4_k": 2,
     "q6_k": 3,
+    "q4_1": 4,
 }
 GGUF_QUANT_CODE_TO_TYPE: Final = {
     code: quant_type for quant_type, code in GGUF_QUANT_TYPE_TO_CODE.items()
@@ -31,12 +32,14 @@ GGUF_BLOCK_BYTES: Final = {
     1: 34,
     2: 144,
     3: 210,
+    4: 20,
 }
 GGUF_BLOCK_ELEMENTS: Final = {
     0: 32,
     1: 32,
     2: 256,
     3: 256,
+    4: 32,
 }
 GGUF_OUTPUT_DTYPES: Final = frozenset({torch.float16, torch.bfloat16})
 GGUF_OUTPUT_DTYPE_TO_CODE: Final = {
@@ -138,7 +141,8 @@ def dequantize_gguf(
     Args:
         data: Packed GGUF storage. Any shape is accepted; storage is flattened
             in logical order and made contiguous before backend dispatch.
-        quant_type: One of ``q4_0``, ``q8_0``, ``q4_k`` or ``q6_k``.
+        quant_type: One of ``q4_0``, ``q4_1``, ``q8_0``, ``q4_k`` or
+            ``q6_k``.
         output_dtype: ``torch.float16`` or ``torch.bfloat16``.
         layout: ``comfyui`` for the plugin's canonical layout. Q4_0 also accepts
             ``interleaved`` for Omni's packed-byte low/high ordering.

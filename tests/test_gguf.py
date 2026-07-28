@@ -8,6 +8,7 @@ import comfy_kitchen as ck
 
 BLOCK_BYTES = {
     "q4_0": 18,
+    "q4_1": 20,
     "q8_0": 34,
     "q4_k": 144,
     "q6_k": 210,
@@ -31,6 +32,13 @@ def _make_blocks(quant_type: str, count: int = 3) -> torch.Tensor:
         if quant_type in {"q4_0", "q8_0"}:
             blocks[index, :2] = torch.tensor(
                 _half_bytes(0.125 * (index + 1)), dtype=torch.uint8
+            )
+        elif quant_type == "q4_1":
+            blocks[index, :2] = torch.tensor(
+                _half_bytes(0.125 * (index + 1)), dtype=torch.uint8
+            )
+            blocks[index, 2:4] = torch.tensor(
+                _half_bytes(-0.25 * (index + 1)), dtype=torch.uint8
             )
         elif quant_type == "q4_k":
             blocks[index, :2] = torch.tensor(
@@ -70,6 +78,14 @@ def _reference_q8_0(block: list[int], dtype: torch.dtype) -> torch.Tensor:
     scale = _half(block[:2], dtype)
     values = [value if value < 128 else value - 256 for value in block[2:]]
     return scale * torch.tensor(values, dtype=dtype)
+
+
+def _reference_q4_1(block: list[int], dtype: torch.dtype) -> torch.Tensor:
+    scale = _half(block[:2], dtype)
+    minimum = _half(block[2:4], dtype)
+    low = [value & 0x0F for value in block[4:]]
+    high = [value >> 4 for value in block[4:]]
+    return scale * torch.tensor(low + high, dtype=dtype) + minimum
 
 
 def _scale_min(scales: list[int]) -> tuple[list[int], list[int]]:
@@ -143,6 +159,8 @@ def _reference(
     for block in blocks:
         if quant_type == "q4_0":
             references.append(_reference_q4_0(block, dtype, layout))
+        elif quant_type == "q4_1":
+            references.append(_reference_q4_1(block, dtype))
         elif quant_type == "q8_0":
             references.append(_reference_q8_0(block, dtype))
         elif quant_type == "q4_k":
@@ -152,7 +170,7 @@ def _reference(
     return torch.cat(references)
 
 
-@pytest.mark.parametrize("quant_type", ["q4_0", "q8_0", "q4_k", "q6_k"])
+@pytest.mark.parametrize("quant_type", ["q4_0", "q4_1", "q8_0", "q4_k", "q6_k"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_eager_matches_independent_reference(quant_type, dtype):
     data = _make_blocks(quant_type)

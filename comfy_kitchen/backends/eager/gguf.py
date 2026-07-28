@@ -80,6 +80,19 @@ def _dequantize_q4_0(
     return (scale * values.to(output_dtype)).reshape(-1)
 
 
+def _dequantize_q4_1(
+    blocks: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    scale = _fp16_column(blocks[:, :2], output_dtype)
+    minimum = _fp16_column(blocks[:, 2:4], output_dtype)
+    packed = blocks[:, 4:]
+    low = packed & 0x0F
+    high = packed >> 4
+    values = torch.cat((low, high), dim=1).to(output_dtype)
+    return (scale * values + minimum).reshape(-1)
+
+
 def _dequantize_q8_0(
     blocks: torch.Tensor,
     output_dtype: torch.dtype,
@@ -173,7 +186,9 @@ def _dequantize_gguf_impl(
         return _dequantize_q8_0(blocks, output_dtype)
     if quant_type_code == 2:
         return _dequantize_q4_k(blocks, output_dtype)
-    return _dequantize_q6_k(blocks, output_dtype)
+    if quant_type_code == 3:
+        return _dequantize_q6_k(blocks, output_dtype)
+    return _dequantize_q4_1(blocks, output_dtype)
 
 
 def dequantize_gguf(
