@@ -34,6 +34,7 @@ __all__ = [
     "quantize_per_tensor_fp8",
     "quantize_svdquant_w4a4",
     "scaled_mm_svdquant_w4a4",
+    "svdquant_w4a16_linear",
     "stochastic_rounding_fp8",
 ]
 
@@ -43,6 +44,7 @@ _NATIVE_CAPABILITIES = frozenset()
 _INT8_AVAILABLE = False
 _INT8_ERROR = None
 _SVDQ_AVAILABLE = False
+_SVDQ_W4A16_AVAILABLE = False
 _NORM_AVAILABLE = False
 _FP8_AVAILABLE = False
 _FP8_QDQ_AVAILABLE = False
@@ -93,6 +95,14 @@ try:
                 "dequantize_svdq_w4",
                 "quantize_svdq_act_int4",
                 "onednn_int4_gemm",
+            )
+        )
+        _SVDQ_W4A16_AVAILABLE = _native_svdq is not None and all(
+            hasattr(_native_svdq, name)
+            for name in (
+                "fused_smooth_mul_convert",
+                "onednn_int4_gemm_add_to_output",
+                "onednn_int4_gemm_preconverted",
             )
         )
         _native_norm = getattr(_extension, "norm", None)
@@ -159,6 +169,9 @@ if _AVAILABLE:
 
     if _SVDQ_AVAILABLE:
         from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
+
+    if _SVDQ_W4A16_AVAILABLE:
+        from .svdquant_w4a16 import svdquant_w4a16_linear
 
     if _FP8_QDQ_AVAILABLE:
         from .fp8 import (
@@ -324,6 +337,43 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
                     default_devices=xpu,
                 ),
             }
+        )
+    if _SVDQ_W4A16_AVAILABLE:
+        capabilities["svdquant_w4a16_linear"] = FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "packed_u4": ParamConstraint(
+                    dtypes=frozenset({torch.uint8}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "scales_f16": ParamConstraint(
+                    dtypes=frozenset({torch.float16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "rcp_smooth_f16": ParamConstraint(
+                    dtypes=frozenset({torch.float16}),
+                    shape_rules=(ExactDims(1),),
+                ),
+                "lora_down": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "lora_up": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "bias": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(1),),
+                ),
+                "output_dtype_code": ParamConstraint(
+                    dtypes=frozenset({int}),
+                ),
+            },
+            default_devices=xpu,
         )
     if _NORM_AVAILABLE:
         capabilities["adaln"] = FunctionConstraints(

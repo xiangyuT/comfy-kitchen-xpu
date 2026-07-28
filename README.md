@@ -44,7 +44,8 @@ The original upstream CUDA and generic-backend README is retained
   `omni_xpu_kernel` before registering capabilities.
 - Intel implementations and adapters for INT8, INT8 ConvRot, FP8
   quantize/dequantize and stochastic rounding, SVDQuant W4A4, arbitrary-2x2
-  RoPE, AdaLN, ConvRot W4A4, and FP8 W8A16 dispatch.
+  RoPE, AdaLN, ConvRot W4A4, FP8 W8A16, managed GGUF dequantization, and
+  Nunchaku-compatible SVDQuant W4A16 dispatch.
 - XPU-aware QuantizedTensor lifecycle, device migration, `linear`, `mm`,
   `addmm`, transpose, serialization, and prepared-weight paths.
 - Target-checked companion-wheel construction for BMG and PTL-H, including
@@ -53,7 +54,8 @@ The original upstream CUDA and generic-backend README is retained
 - XPU operator tests, portable tensor tests, and self-hosted device workflows.
 
 Excluding the explicitly deferred NVFP4, MXFP8, and AWQ formats, the XPU
-backend registers all 24 capabilities in its current target set.
+backend registers each capability independently from the native symbols
+available in the installed companion wheel.
 
 ## XPU backend behavior
 
@@ -69,11 +71,11 @@ The XPU backend becomes available only when:
 2. `omni_xpu_kernel` and its native extension load;
 3. the required native INT8 symbols are present.
 
-Optional SVDQuant, normalization, FP8, RoPE, and ConvRot capability groups are
-detected separately. A partial or older native package therefore advertises
-only the operations it actually implements. Triton remains available on
-non-Windows XPU stacks that support it, with eager implementations as the
-portable fallback.
+Optional SVDQuant W4A4/W4A16, normalization, FP8, RoPE, ConvRot, and GGUF
+capability groups are detected separately. A partial or older native package
+therefore advertises only the operations it actually implements. Triton
+remains available on non-Windows XPU stacks that support it, with eager
+implementations as the portable fallback.
 
 On Windows, Triton is reported as unavailable by default because its JIT
 compiler/runtime is not part of the validated XPU Portable path. Dispatch uses
@@ -119,8 +121,7 @@ The XPU integration uses the pure-Python Kitchen wheel; native Intel code stays
 in `omni_xpu_kernel`.
 
 ```bash
-git clone --branch dev/ptl-h-kitchen-xpu \
-    https://github.com/xiangyuT/comfy-kitchen-xpu.git
+git clone https://github.com/xiangyuT/comfy-kitchen-xpu.git
 cd comfy-kitchen-xpu
 python -m pip install build
 python -m build --wheel

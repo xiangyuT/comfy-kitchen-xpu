@@ -28,6 +28,7 @@ __all__ = [
     "scaled_mm_mxfp8",
     "scaled_mm_nvfp4",
     "scaled_mm_svdquant_w4a4",
+    "svdquant_w4a16_linear",
     "stochastic_rounding_fp8",
     "int8_linear",
     "mm_int8",
@@ -74,6 +75,7 @@ from .quantization import (
 )
 from .rope import apply_rope, apply_rope1, apply_rope_split_half, apply_rope_split_half1
 from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
+from .svdquant_w4a16 import svdquant_w4a16_linear
 
 
 def _build_constraints() -> dict:
@@ -231,6 +233,42 @@ def _build_constraints() -> dict:
                     shape_rules=(ExactDims(2),),
                 ),
                 "lora_up": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        "svdquant_w4a16_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "packed_u4": ParamConstraint(
+                    dtypes=frozenset({torch.uint8}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "scales_f16": ParamConstraint(
+                    dtypes=frozenset({torch.float16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "rcp_smooth_f16": ParamConstraint(
+                    dtypes=frozenset({torch.float16}),
+                    shape_rules=(ExactDims(1),),
+                ),
+                "lora_down": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "lora_up": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "bias": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(1),),
+                ),
+                "output_dtype_code": ParamConstraint(
+                    dtypes=frozenset({int}),
+                ),
             },
             default_devices=all_devices,
         ),
