@@ -112,6 +112,10 @@ class BackendRegistry:
         """
         return backend_name in self._backends and backend_name not in self._disabled
 
+    def get_backend_override(self) -> str | None:
+        """Return the active thread-local backend override, if any."""
+        return getattr(self._thread_local, "backend_override", None)
+
     def list_backends(self) -> dict:
         """Return dict of all backends with their status.
 

@@ -152,6 +152,46 @@ def test_destructive_preparation_keeps_one_full_weight_storage_on_xpu():
     assert output.shape == (case["x"].shape[0], 64)
 
 
+def test_prepared_auto_route_uses_cached_xpu_implementation():
+    case = _make_case(n=64, k=128, device="xpu")
+    prepared = ck.prepare_svdquant_w4a16_for_xpu(
+        case["qweight"],
+        case["wscales"],
+        case["smooth"],
+        destructive=False,
+    )
+    assert prepared.xpu_linear_impl is not None
+
+    ck.get_svdquant_w4a16_route_diagnostics(reset=True)
+    actual = ck.svdquant_w4a16_linear(case["x"], prepared)
+    with ck.use_backend("xpu"):
+        dispatched = ck.svdquant_w4a16_linear(case["x"], prepared)
+    assert torch.equal(actual.view(torch.uint8), dispatched.view(torch.uint8))
+    assert ck.get_svdquant_w4a16_route_diagnostics(reset=True) == {
+        "routes": {"xpu": 2},
+        "fallbacks": {},
+    }
+
+
+def test_explicit_eager_override_bypasses_cached_xpu_implementation():
+    case = _make_case(n=64, k=128, device="xpu")
+    prepared = ck.prepare_svdquant_w4a16_for_xpu(
+        case["qweight"],
+        case["wscales"],
+        case["smooth"],
+        destructive=False,
+    )
+
+    ck.get_svdquant_w4a16_route_diagnostics(reset=True)
+    with ck.use_backend("eager"):
+        output = ck.svdquant_w4a16_linear(case["x"], prepared)
+    assert output.shape == (case["x"].shape[0], 64)
+    assert ck.get_svdquant_w4a16_route_diagnostics(reset=True) == {
+        "routes": {"eager": 1},
+        "fallbacks": {},
+    }
+
+
 def test_runtime_failure_falls_back_once_then_quarantines(monkeypatch):
     from comfy_kitchen.backends.xpu import svdquant_w4a16 as xpu_w4a16
 

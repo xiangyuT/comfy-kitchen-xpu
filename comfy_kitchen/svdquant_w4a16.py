@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import threading
 from collections import Counter
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 import torch
 
 from .backends.eager.quantization import DTYPE_TO_CODE
+from .exceptions import BackendError
 
 _GROUP_SIZE = 64
 _OUTPUT_DTYPES = frozenset({torch.float16, torch.bfloat16})
@@ -36,6 +38,11 @@ class PreparedSVDQuantW4A16:
     group_size: int
     in_features: int
     out_features: int
+    xpu_linear_impl: Callable[..., torch.Tensor] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 def _record_svdquant_w4a16_route(
@@ -161,6 +168,21 @@ def prepare_svdquant_w4a16_for_xpu(
         if smooth is not None
         else None
     )
+
+    xpu_linear_impl = None
+    if qweight.device.type == "xpu":
+        from .registry import registry
+
+        try:
+            xpu_linear_impl = registry.get_implementation(
+                "svdquant_w4a16_linear",
+                backend="xpu",
+            )
+        except BackendError:
+            # Keep preparation portable when the companion wheel is absent or
+            # too old. The public call will use normal registry dispatch.
+            pass
+
     if destructive:
         packed_u4 = qweight.view(torch.uint8)
         packed_u4.bitwise_xor_(0x88)
@@ -178,6 +200,7 @@ def prepare_svdquant_w4a16_for_xpu(
         group_size=_GROUP_SIZE,
         in_features=in_features,
         out_features=out_features,
+        xpu_linear_impl=xpu_linear_impl,
     )
 
 
@@ -266,23 +289,29 @@ def svdquant_w4a16_linear(
     lora_up: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
+    validate: bool = True,
 ) -> torch.Tensor:
     """Run W4A16 main path plus LoRA and bias on raw, unsmoothed input.
 
     LoRA always consumes ``x`` before smoothing. The main path consumes an FP16
     ``x * reciprocal(smooth)`` intermediate when a smooth factor was prepared.
     This fixes the operator boundary used by the current Nunchaku XPU route.
+
+    Set ``validate=False`` only for a model-owned prepared path whose tensor
+    shapes, dtypes, and devices were already fixed and tested. The default
+    public contract validates every call.
     """
     selected_dtype = x.dtype if output_dtype is None else output_dtype
-    _validate_linear(
-        x,
-        prepared,
-        lora_down,
-        lora_up,
-        bias,
-        selected_dtype,
-    )
-    return torch.ops.comfy_kitchen.svdquant_w4a16_linear(
+    if validate:
+        _validate_linear(
+            x,
+            prepared,
+            lora_down,
+            lora_up,
+            bias,
+            selected_dtype,
+        )
+    op_args = (
         x,
         prepared.packed_u4,
         prepared.scales_f16,
@@ -292,6 +321,23 @@ def svdquant_w4a16_linear(
         bias,
         DTYPE_TO_CODE[selected_dtype],
     )
+
+    # Prepared XPU weights already fixed the backend and validated its native
+    # capability once at model load. Bypass torch.library and registry lookup
+    # on the per-layer hot path, while preserving explicit use_backend()
+    # overrides and runtime backend disablement for testing/recovery.
+    if prepared.xpu_linear_impl is not None:
+        from .registry import registry
+
+        if (
+            registry.get_backend_override() is None
+            and registry.is_available("xpu")
+            and x.device.type == "xpu"
+            and x.dtype == torch.bfloat16
+        ):
+            return prepared.xpu_linear_impl(*op_args)
+
+    return torch.ops.comfy_kitchen.svdquant_w4a16_linear(*op_args)
 
 
 __all__ = [
