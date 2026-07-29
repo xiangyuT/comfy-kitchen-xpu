@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "comfy-kitchen"
-version = "0.2.19"
+version = "0.2.18"
 description = "Intel XPU kernel integration for ComfyUI"
 readme = "packaging/XPU_WHEEL_README.md"
 requires-python = ">=3.10"
