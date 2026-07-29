@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from collections import Counter
 from collections.abc import Callable
@@ -17,6 +18,12 @@ _OUTPUT_DTYPES = frozenset({torch.float16, torch.bfloat16})
 _DIAGNOSTICS_LOCK = threading.Lock()
 _ROUTE_COUNTS: Counter[str] = Counter()
 _FALLBACK_COUNTS: Counter[str] = Counter()
+_PROFILE_BOUNDARY_ENV = "COMFY_KITCHEN_PROFILE_BOUNDARIES"
+
+
+def _profile_operator_boundary_enabled() -> bool:
+    """Return whether trace runs require the public torch.library boundary."""
+    return os.environ.get(_PROFILE_BOUNDARY_ENV, "").strip() == "1"
 
 
 @dataclass(frozen=True)
@@ -326,7 +333,10 @@ def svdquant_w4a16_linear(
     # capability once at model load. Bypass torch.library and registry lookup
     # on the per-layer hot path, while preserving explicit use_backend()
     # overrides and runtime backend disablement for testing/recovery.
-    if prepared.xpu_linear_impl is not None:
+    if (
+        prepared.xpu_linear_impl is not None
+        and not _profile_operator_boundary_enabled()
+    ):
         from .registry import registry
 
         if (

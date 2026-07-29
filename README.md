@@ -125,7 +125,7 @@ git clone https://github.com/xiangyuT/comfy-kitchen-xpu.git
 cd comfy-kitchen-xpu
 python -m pip install build
 python -m build --wheel
-pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.18-py3-none-any.whl
+pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.19-py3-none-any.whl
 ```
 
 The repository retains upstream CUDA source to keep future upstream updates

@@ -173,6 +173,26 @@ def test_prepared_auto_route_uses_cached_xpu_implementation():
     }
 
 
+def test_profile_mode_restores_public_operator_boundary(monkeypatch):
+    case = _make_case(n=64, k=128, device="xpu")
+    prepared = ck.prepare_svdquant_w4a16_for_xpu(
+        case["qweight"],
+        case["wscales"],
+        case["smooth"],
+        destructive=False,
+    )
+    monkeypatch.setenv("COMFY_KITCHEN_PROFILE_BOUNDARIES", "1")
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        record_shapes=True,
+    ) as profile:
+        output = ck.svdquant_w4a16_linear(case["x"], prepared)
+    assert output.shape == (case["x"].shape[0], 64)
+    names = {event.key for event in profile.key_averages()}
+    assert "comfy_kitchen::svdquant_w4a16_linear" in names
+
+
 def test_explicit_eager_override_bypasses_cached_xpu_implementation():
     case = _make_case(n=64, k=128, device="xpu")
     prepared = ck.prepare_svdquant_w4a16_for_xpu(
