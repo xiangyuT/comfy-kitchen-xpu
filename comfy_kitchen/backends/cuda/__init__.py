@@ -20,12 +20,31 @@ import sys
 
 import torch
 
+from comfy_kitchen._rope_utils import (
+    check_rope_inplace,
+    detect_rms_rope_bnhd,
+    trim_rope_freqs,
+)
+
 __all__ = [
     "adaln",
+    "rms_adaln",
     "apply_rope",
+    "apply_rope_",
     "apply_rope1",
+    "apply_rope1_",
     "apply_rope_split_half",
+    "apply_rope_split_half_",
     "apply_rope_split_half1",
+    "apply_rope_split_half1_",
+    "rms_rope",
+    "rms_rope_",
+    "rms_rope1",
+    "rms_rope1_",
+    "rms_rope_split_half",
+    "rms_rope_split_half_",
+    "rms_rope_split_half1",
+    "rms_rope_split_half1_",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
     "dequantize_int8_simple",
@@ -124,7 +143,17 @@ except Exception as e:
     _EXT_ERROR = f"Failed to load extension: {e}"
     _C = None  # type: ignore
 
+from comfy_kitchen.backends._activations import (  # noqa: E402
+    apply_input_act as _apply_input_act,
+)
+from comfy_kitchen.backends._activations import (  # noqa: E402
+    input_act_code as _input_act_code,
+)
+from comfy_kitchen.backends._activations import (  # noqa: E402
+    input_act_width as _input_act_width,
+)
 from comfy_kitchen.backends._modulation import adaln_prep_modulation  # noqa: E402
+from comfy_kitchen.backends.eager import rope as _eager_rope  # noqa: E402
 from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
     DTYPE_CODE_TO_DTYPE,
     DTYPE_TO_CODE,
@@ -145,6 +174,7 @@ from comfy_kitchen.constraints import (  # noqa: E402
     FunctionConstraints,
     MinDims,
     ParamConstraint,
+    ValidationResult,
 )
 from comfy_kitchen.float_utils import roundup  # noqa: E402
 from comfy_kitchen.registry import registry  # noqa: E402
@@ -158,10 +188,43 @@ _CUBLASLT_AVAILABLE = _EXT_AVAILABLE and getattr(_C, "HAS_CUBLASLT", False)
 _cublas_workspaces: dict[int, torch.Tensor] = {}
 _empty_cuda_tensors: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
 _turing_device_cache: dict[int, bool] = {}
+_nvidia_16_series_device_cache: dict[int, bool] = {}
 _cutlass_int8_device_cache: dict[int, bool] = {}
+_device_capability_cache: dict[int, tuple[int, int]] = {}
+_device_multiprocessor_count_cache: dict[int, int] = {}
 _FORCE_INT4_INT8_FALLBACK = os.environ.get("COMFY_KITCHEN_FORCE_INT4_INT8_FALLBACK", "0") == "1"
 _INT4_PACKED_WEIGHT_SMALL_M_MAX = 8
 _INT4_INT8_WEIGHT_CHUNK_N = max(1, int(os.environ.get("COMFY_KITCHEN_INT4_INT8_WEIGHT_CHUNK_N", "4096")))
+_NVIDIA_16_SERIES = (
+    "1660",
+    "1650",
+    "1630",
+    "T500",
+    "T550",
+    "T600",
+    "MX550",
+    "MX450",
+    "CMP 30HX",
+    "T2000",
+    "T1000",
+    "T1200",
+)
+
+
+def _cuda_device_capability(device_index: int) -> tuple[int, int]:
+    capability = _device_capability_cache.get(device_index)
+    if capability is None:
+        capability = torch.cuda.get_device_capability(device_index)
+        _device_capability_cache[device_index] = capability
+    return capability
+
+
+def _cuda_device_multiprocessor_count(device_index: int) -> int:
+    count = _device_multiprocessor_count_cache.get(device_index)
+    if count is None:
+        count = torch.cuda.get_device_properties(device_index).multi_processor_count
+        _device_multiprocessor_count_cache[device_index] = count
+    return count
 
 
 def _cuda_device_is_turing(device_index: int) -> bool:
@@ -171,6 +234,29 @@ def _cuda_device_is_turing(device_index: int) -> bool:
     is_turing = torch.cuda.get_device_capability(device_index) == (7, 5)
     _turing_device_cache[device_index] = is_turing
     return is_turing
+
+
+def _cuda_device_is_nvidia_16_series(device_index: int) -> bool:
+    cached = _nvidia_16_series_device_cache.get(device_index)
+    if cached is not None:
+        return cached
+    is_16_series = False
+    if _cuda_device_is_turing(device_index):
+        device_name = torch.cuda.get_device_name(device_index)
+        is_16_series = any(model in device_name for model in _NVIDIA_16_SERIES)
+    _nvidia_16_series_device_cache[device_index] = is_16_series
+    return is_16_series
+
+
+def _cuda_device_should_use_turing_kernels(device_index: int) -> bool:
+    return _cuda_device_is_turing(device_index) and not _cuda_device_is_nvidia_16_series(
+        device_index
+    )
+
+
+def _prefer_turing_fused_int8(m: int, n: int, k: int) -> bool:
+    """Use fused SM75 kernels for latency shapes and feed-forward expansions."""
+    return m <= 128 or n >= 2 * k
 
 
 def _cuda_device_supports_cutlass_int8_dequant(tensor: torch.Tensor) -> bool:
@@ -189,11 +275,38 @@ def _cuda_device_supports_cutlass_int8_dequant(tensor: torch.Tensor) -> bool:
 def _cuda_device_supports_native_int4_mma(tensor: torch.Tensor) -> bool:
     if not tensor.is_cuda or _FORCE_INT4_INT8_FALLBACK:
         return False
-    major, _minor = torch.cuda.get_device_capability(tensor.get_device())
+    major, _minor = _cuda_device_capability(tensor.get_device())
     # The current ConvRot W4A4 kernel emits m16n8k64 s4 MMA, which is the
     # sm80+ integer MMA shape. Hopper is routed through the INT8 fallback for
     # better behavior with this implementation.
     return major == 8
+
+
+def _prefer_legacy_int4_kernel(
+    m: int,
+    n: int,
+    k: int,
+    device_index: int,
+) -> bool:
+    """Select the low-latency kernel for native SM8x INT4 shapes."""
+    m_tile = max(32, 1 << (m - 1).bit_length())
+    base_threshold = 1_048_576 if k <= 1_024 else 786_432
+    threshold = base_threshold * _cuda_device_multiprocessor_count(device_index) // 142
+    workload = m_tile * n
+    return n < 32_768 and (
+        workload < threshold
+        or (k > 1_024 and workload == threshold and 128 <= m == m_tile < 512)
+    )
+
+
+def _should_use_turing_int4(tensor: torch.Tensor) -> bool:
+    return (
+        tensor.is_cuda
+        and not _FORCE_INT4_INT8_FALLBACK
+        and tensor.shape[0] > _INT4_PACKED_WEIGHT_SMALL_M_MAX
+        and _cuda_device_should_use_turing_kernels(tensor.get_device())
+        and hasattr(_C, "cutlass_turing_int4_dequant")
+    )
 
 
 def _cublas_int8_n_alignment(tensor: torch.Tensor) -> int:
@@ -226,12 +339,21 @@ def _pad_1d(x: torch.Tensor, padded_size: int) -> torch.Tensor:
     return torch.cat((x.reshape(-1), padding), dim=0).contiguous()
 
 
+_max_shared_memory_cache: dict[int, int] = {}
+
+
 def _max_dynamic_shared_memory_per_block(x: torch.Tensor) -> int:
     device_index = x.get_device()
-    props = torch.cuda.get_device_properties(x.get_device())
+    cached = _max_shared_memory_cache.get(device_index)
+    if cached is not None:
+        return cached
+    props = torch.cuda.get_device_properties(device_index)
     if _cuda_device_is_turing(device_index):
-        return props.shared_memory_per_block
-    return getattr(props, "shared_memory_per_block_optin", props.shared_memory_per_block)
+        limit = props.shared_memory_per_block
+    else:
+        limit = getattr(props, "shared_memory_per_block_optin", props.shared_memory_per_block)
+    _max_shared_memory_cache[device_index] = limit
+    return limit
 
 
 def _convrot_int8_fused_shared_memory_bytes(m: int, k: int) -> int:
@@ -337,15 +459,13 @@ def _int8_weight_scale_arg(weight_scale: torch.Tensor, device: torch.device) -> 
     return weight_scale.to(device=device, dtype=torch.float32).reshape(-1).contiguous()
 
 
-def _prefer_cublas_int8_fallback(m: int, n: int, k: int) -> bool:
-    cutlass_n_le_k_exception = (
-        (n == k and n <= 2560)
-        or (m >= 1024 and n == 2560 and k == 6912)
-    )
-    return m > 1 and (
-        (n <= k and not cutlass_n_le_k_exception)
-        or (m <= 512 and k >= 4096 and n > k and n <= 3 * k)
-    )
+def _prefer_cublas_int8_fallback(
+    m: int,
+    n: int,
+    k: int,
+    device_index: int,
+) -> bool:
+    return False
 
 
 def _wrap_for_dlpack(tensor: torch.Tensor):
@@ -728,6 +848,7 @@ def _int4_weight_int8_act_gemm_dequant_chunked(
         _wrap_for_dlpack(acc_workspace),
         _wrap_for_dlpack(get_cublas_workspace()),
         chunk_cols,
+        not _cuda_device_is_turing(x_int8.get_device()),
         DTYPE_TO_CODE[out_dtype],
         stream_ptr,
     )
@@ -774,8 +895,29 @@ def _int4_linear_via_int8_values(
         )
         return output
 
+    if (
+        _prefer_turing_fused_int8(m, n, k)
+        and _cuda_device_should_use_turing_kernels(x_int8.get_device())
+        and hasattr(_C, "cutlass_turing_int8_dequant")
+    ):
+        turing_output = _int8_linear_turing_quantized(
+            x_int8,
+            weight_int8,
+            x_scale_arg,
+            weight_scale_arg,
+            bias_arg if bias is not None else None,
+            out_dtype,
+        )
+        if turing_output is not None:
+            return turing_output
+
     used_cutlass = False
-    prefer_cublas_fallback = _prefer_cublas_int8_fallback(m, n, k)
+    prefer_cublas_fallback = _prefer_cublas_int8_fallback(
+        m,
+        n,
+        k,
+        x_int8.get_device(),
+    )
     if (
         not prefer_cublas_fallback
         and not _DISABLE_CUTLASS_INT8
@@ -828,6 +970,39 @@ def _int4_linear_via_int8_values(
     return output
 
 
+def _int8_linear_turing_quantized(
+    x_qdata: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+) -> torch.Tensor | None:
+    """Run row-wise INT8 GEMM with Turing tensor cores and a fused scale epilogue."""
+    m = x_qdata.shape[0]
+    n = weight.shape[0]
+    output = torch.empty((m, n), dtype=out_dtype, device=x_qdata.device)
+    weight_scale_arg = weight_scale.reshape(-1)
+    bias_arg = (
+        bias.to(device=x_qdata.device, dtype=out_dtype).contiguous()
+        if bias is not None
+        else _empty_cuda_tensor(x_qdata.device, out_dtype)
+    )
+    used_int8 = _C.cutlass_turing_int8_dequant(
+        _wrap_for_dlpack(x_qdata),
+        _wrap_for_dlpack(weight),
+        _wrap_for_dlpack(x_scale.reshape(-1)),
+        _wrap_for_dlpack(weight_scale_arg),
+        _wrap_for_dlpack(bias_arg),
+        _wrap_for_dlpack(output),
+        DTYPE_TO_CODE[out_dtype],
+        torch.cuda.current_stream(x_qdata.device).cuda_stream,
+    )
+    if not used_int8:
+        return None
+    return output
+
+
 def _int4_linear_via_int8(
     x_qdata: torch.Tensor,
     weight: torch.Tensor,
@@ -850,6 +1025,39 @@ def _int4_linear_via_int8(
     return _int4_linear_via_int8_values(x_int8, weight_int8, x_scale, weight_scale, bias, out_dtype)
 
 
+def _int4_linear_turing(
+    x_qdata: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+) -> torch.Tensor | None:
+    """Run packed W4A4 with Turing's native m8n8k32 INT4 tensor cores."""
+    m = x_qdata.shape[0]
+    n = weight.shape[0]
+    output = torch.empty((m, n), dtype=out_dtype, device=x_qdata.device)
+    stream_ptr = torch.cuda.current_stream(x_qdata.device).cuda_stream
+    bias_arg = (
+        bias.to(device=x_qdata.device, dtype=torch.float32).contiguous()
+        if bias is not None
+        else _empty_cuda_tensor(x_qdata.device, torch.float32)
+    )
+    used_int4 = _C.cutlass_turing_int4_dequant(
+        _wrap_for_dlpack(x_qdata),
+        _wrap_for_dlpack(weight),
+        _wrap_for_dlpack(x_scale),
+        _wrap_for_dlpack(weight_scale),
+        _wrap_for_dlpack(bias_arg),
+        _wrap_for_dlpack(output),
+        DTYPE_TO_CODE[out_dtype],
+        stream_ptr,
+    )
+    if not used_int4:
+        return None
+    return output
+
+
 def int4_linear(
     x_qdata: torch.Tensor,
     weight: torch.Tensor,
@@ -863,8 +1071,9 @@ def int4_linear(
         raise ValueError("INT4 linear expects 2D activation and weight tensors")
     if x_qdata.shape[1] != weight.shape[1]:
         raise ValueError("INT4 linear activation/weight K dimensions do not match")
-    m, _k_half = x_qdata.shape
+    m, k_half = x_qdata.shape
     n = weight.shape[0]
+    k = k_half * 2
     output = torch.empty((m, n), dtype=out_dtype, device=x_qdata.device)
     x_scale_arg = x_scale.to(device=x_qdata.device, dtype=torch.float32).reshape(-1).contiguous()
     weight_scale_arg = weight_scale.to(device=x_qdata.device, dtype=torch.float32).reshape(-1).contiguous()
@@ -876,6 +1085,17 @@ def int4_linear(
     if bias is not None and (bias.device != x_qdata.device or not bias.is_contiguous()):
         bias_arg = bias.to(device=x_qdata.device).contiguous()
     stream_ptr = torch.cuda.current_stream(x_qdata.device).cuda_stream
+    if _should_use_turing_int4(x_qdata):
+        turing_output = _int4_linear_turing(
+            x_qdata.contiguous(),
+            weight.contiguous(),
+            x_scale_arg,
+            weight_scale_arg,
+            bias_arg if bias is not None else None,
+            out_dtype,
+        )
+        if turing_output is not None:
+            return turing_output
     if not _cuda_device_supports_native_int4_mma(x_qdata):
         return _int4_linear_via_int8(
             x_qdata.contiguous(),
@@ -888,7 +1108,7 @@ def int4_linear(
     used_cutlass = False
     if (
         not _DISABLE_CUTLASS_INT8
-        and _cuda_device_supports_native_int4_mma(x_qdata)
+        and not _prefer_legacy_int4_kernel(m, n, k, x_qdata.get_device())
         and _cuda_device_supports_cutlass_int8_dequant(x_qdata)
         and hasattr(_C, "cutlass_int4_dequant")
     ):
@@ -1011,7 +1231,9 @@ def convrot_w4a4_linear(
 
     orig_shape = x.shape
     x2d = x.reshape(-1, orig_shape[-1]).contiguous()
-    if linear_dtype == "int8" or not _cuda_device_supports_native_int4_mma(x2d):
+    if linear_dtype == "int8" or not (
+        _cuda_device_supports_native_int4_mma(x2d) or _should_use_turing_int4(x2d)
+    ):
         if (
             convrot_groupsize == 256
             and x2d.shape[-1] % 256 == 0
@@ -1145,9 +1367,18 @@ def quantize_int8_rowwise_convrot64(
     weight_2d: torch.Tensor,
     group_size: int,
     stochastic_rounding: int | None = 0,
+    input_act: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused ConvRot row-wise INT8 quantization using 64-lane groups."""
-    q_2d = torch.empty_like(weight_2d, dtype=torch.int8)
+    """Fused ConvRot row-wise INT8 quantization using 64-lane groups.
+
+    input_act applies an activation on the way in, so an MLP's
+    `linear(act(proj(x)))` never materializes act's output in bf16. For the
+    gated "swiglu" pair the input rows are [gate | up] and the quantized rows
+    are half as wide.
+    """
+    q_2d = torch.empty(
+        (weight_2d.shape[0], weight_2d.shape[1] // _input_act_width(input_act)),
+        dtype=torch.int8, device=weight_2d.device)
     scales_2d = torch.empty((weight_2d.shape[0], 1), dtype=torch.float32, device=weight_2d.device)
     stream_ptr = torch.cuda.current_stream(weight_2d.device).cuda_stream
     _C.quantize_int8_rowwise_convrot64(
@@ -1156,6 +1387,7 @@ def quantize_int8_rowwise_convrot64(
         _wrap_for_dlpack(scales_2d),
         group_size,
         stochastic_rounding is not None and stochastic_rounding > 0,
+        _input_act_code(input_act),
         int(stochastic_rounding or 0),
         stream_ptr,
     )
@@ -1506,6 +1738,7 @@ def int8_linear(
     out_dtype: torch.dtype = None,
     convrot: bool = False,
     convrot_groupsize: int = 256,
+    input_act: str | None = None,
 ) -> torch.Tensor:
     orig_shape = x.shape
     x_2d = x if x.dim() == 2 and x.is_contiguous() else x.reshape(-1, x.shape[-1]).contiguous()
@@ -1513,7 +1746,23 @@ def int8_linear(
         weight = weight.contiguous()
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
 
-    m, k = x_2d.shape
+    # Only the fused ConvRot quantizer can absorb the activation; every other
+    # route applies it eagerly here and proceeds unchanged, so all paths agree.
+    # k_act is the activated (quantized) row width: swiglu halves the raw row.
+    k_act = x_2d.shape[-1] // _input_act_width(input_act)
+    _fused_convrot_ok = (
+        convrot
+        and convrot_groupsize == 256
+        and k_act % 256 == 0
+        and 256 <= k_act <= _CONVROT_FUSED_MAX_K
+        and _convrot_fused_shared_memory_fits(x_2d, k_act, convrot_groupsize)
+    )
+    if input_act not in (None, "none") and not (_fused_convrot_ok and x_2d.shape[0] > 1):
+        x_2d = _apply_input_act(x_2d, input_act)
+        input_act = None
+
+    m = x_2d.shape[0]
+    k = k_act
     n, k_w = weight.shape
     assert k == k_w, "Input and weight inner dimensions must match"
 
@@ -1559,16 +1808,10 @@ def int8_linear(
 
     # cuBLAS INT8 GEMM requires row-wise quantized activations and tensor-wise quantized weights.
     if convrot:
-        k = x_2d.shape[-1]
         # Fused wins for small K (narrow block) and large K (wide block); the
         # 5120 < K < 8192 band loses to the rotate-matmul path on both, so skip
         # it. (Real model hidden dims avoid that band anyway.)
-        if (
-            convrot_groupsize == 256
-            and k % 256 == 0
-            and 256 <= k <= _CONVROT_FUSED_MAX_K
-            and _convrot_fused_shared_memory_fits(x_2d, k, convrot_groupsize)
-        ):
+        if _fused_convrot_ok:
             x_qdata = torch.empty((m, k), dtype=torch.int8, device=x.device)
             x_scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
             _C.quantize_int8_rowwise_convrot64(
@@ -1577,6 +1820,7 @@ def int8_linear(
                 _wrap_for_dlpack(x_scale),
                 convrot_groupsize,
                 False,
+                _input_act_code(input_act),
                 0,
                 stream_ptr,
             )
@@ -1623,8 +1867,29 @@ def int8_linear(
     if bias is not None and (bias.device != x.device or bias.dtype != out_dtype or not bias.is_contiguous()):
         bias_arg = bias.to(device=x.device, dtype=out_dtype).contiguous()
 
+    if (
+        _prefer_turing_fused_int8(m, n, k)
+        and _cuda_device_should_use_turing_kernels(x_qdata.get_device())
+        and hasattr(_C, "cutlass_turing_int8_dequant")
+    ):
+        turing_out = _int8_linear_turing_quantized(
+            x_qdata,
+            weight,
+            x_scale,
+            weight_scale,
+            bias_arg if bias is not None else None,
+            out_dtype,
+        )
+        if turing_out is not None:
+            return turing_out if is_2d_output else turing_out.reshape(*orig_shape[:-1], n)
+
     used_cutlass = False
-    prefer_cublas_fallback = _prefer_cublas_int8_fallback(m, n, k)
+    prefer_cublas_fallback = _prefer_cublas_int8_fallback(
+        m,
+        n,
+        k,
+        x_qdata.get_device(),
+    )
     if (
         not prefer_cublas_fallback
         and not _DISABLE_CUTLASS_INT8
@@ -1678,7 +1943,7 @@ def int8_linear(
     return out if is_2d_output else out.reshape(*orig_shape[:-1], n)
 
 
-def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def _adaln_impl(kernel, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float):
     orig_shape = x.shape
     d = x.shape[-1]
     n = x.numel() // d
@@ -1694,7 +1959,7 @@ def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float 
     dtype_code = DTYPE_TO_CODE[x.dtype]
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
 
-    _C.adaln(
+    kernel(
         _wrap_for_dlpack(x_flat),
         _wrap_for_dlpack(scale_flat),
         _wrap_for_dlpack(shift_flat),
@@ -1711,13 +1976,20 @@ def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float 
     return out_flat.reshape(orig_shape)
 
 
-def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    if not x.is_contiguous():
-        x = x.contiguous()
-    if not freqs_cis.is_contiguous():
-        freqs_cis = freqs_cis.contiguous()
+def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    return _adaln_impl(_C.adaln, x, scale, shift, eps)
 
-    x_out = torch.empty_like(x)
+
+def rms_adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    return _adaln_impl(_C.rms_adaln, x, scale, shift, eps)
+
+
+def _apply_rope1_cuda(
+    x: torch.Tensor, freqs_cis: torch.Tensor, *, split_half: bool, inplace: bool
+) -> torch.Tensor:
+    if not split_half:
+        freqs_cis = trim_rope_freqs(x, freqs_cis)
+    x_out = x if inplace else torch.empty_like(x)
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
 
     _C.apply_rope(
@@ -1727,27 +1999,24 @@ def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         None,  # xk
         None,  # xk_out
         stream_ptr,
-        False,
+        split_half,
     )
-
     return x_out
 
 
-def apply_rope(
-    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+def _apply_rope_cuda(
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor, *,
+    split_half: bool, inplace: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if xq.shape != xk.shape:  # TODO: fix cuda apply_rope to not need this?
-        return apply_rope1(xq, freqs_cis), apply_rope1(xk, freqs_cis)
-
-    if not xq.is_contiguous():
-        xq = xq.contiguous()
-    if not xk.is_contiguous():
-        xk = xk.contiguous()
-    if not freqs_cis.is_contiguous():
-        freqs_cis = freqs_cis.contiguous()
-
-    xq_out = torch.empty_like(xq)
-    xk_out = torch.empty_like(xk)
+    if xq.shape != xk.shape:
+        return (
+            _apply_rope1_cuda(xq, freqs_cis, split_half=split_half, inplace=inplace),
+            _apply_rope1_cuda(xk, freqs_cis, split_half=split_half, inplace=inplace),
+        )
+    if not split_half:
+        freqs_cis = trim_rope_freqs(xq, freqs_cis)
+    xq_out = xq if inplace else torch.empty_like(xq)
+    xk_out = xk if inplace else torch.empty_like(xk)
     stream_ptr = torch.cuda.current_stream(xq.device).cuda_stream
 
     _C.apply_rope(
@@ -1757,32 +2026,277 @@ def apply_rope(
         _wrap_for_dlpack(xk),
         _wrap_for_dlpack(xk_out),
         stream_ptr,
-        False,
+        split_half,
     )
-
     return xq_out, xk_out
 
 
-def apply_rope_split_half1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    if not x.is_contiguous():
-        x = x.contiguous()
-    if not freqs_cis.is_contiguous():
-        freqs_cis = freqs_cis.contiguous()
+def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    return _apply_rope1_cuda(x, freqs_cis, split_half=False, inplace=False)
 
-    x_out = torch.empty_like(x)
+
+def apply_rope1_(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    check_rope_inplace(x, readonly=(freqs_cis,))
+    return _apply_rope1_cuda(x, freqs_cis, split_half=False, inplace=True)
+
+
+def apply_rope(
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _apply_rope_cuda(xq, xk, freqs_cis, split_half=False, inplace=False)
+
+
+def apply_rope_(
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    check_rope_inplace(xq, xk, readonly=(freqs_cis,))
+    return _apply_rope_cuda(xq, xk, freqs_cis, split_half=False, inplace=True)
+
+
+def _validate_cuda_rms_rope1(kwargs: dict[str, object]) -> ValidationResult:
+    x = kwargs["x"]
+    freqs_cis = kwargs["freqs_cis"]
+    assert isinstance(x, torch.Tensor) and isinstance(freqs_cis, torch.Tensor)
+    if _native_rms_rope_layout(x, freqs_cis, extension_op="rms_rope1") is None:
+        return ValidationResult.fail("x", "CUDA fused RMS-RoPE requires a supported native layout")
+    return ValidationResult.ok()
+
+
+def _validate_cuda_rms_rope(kwargs: dict[str, object]) -> ValidationResult:
+    q, k = kwargs["q"], kwargs["k"]
+    q_scale = kwargs.get("q_scale")
+    if q_scale is None:
+        return ValidationResult.fail("q_scale", "is required for fused CUDA RMS-RoPE")
+    k_scale = kwargs.get("k_scale")
+    if k_scale is None:
+        k_scale = q_scale
+    assert all(isinstance(value, torch.Tensor) for value in (q, k, q_scale, k_scale))
+    freqs_cis = kwargs["freqs_cis"]
+    rot_dim = int(kwargs.get("rot_dim") or 0)
+    extension_op = "rms_rope" if k.shape == q.shape else "rms_rope1"
+    if _native_rms_rope_layout(q, freqs_cis, extension_op=extension_op, rot_dim=rot_dim) is None:
+        return ValidationResult.fail("q", "CUDA fused RMS-RoPE requires a supported native layout")
+    if k.dtype != q.dtype:
+        return ValidationResult.fail("k", "must have the same dtype as q for fused CUDA RMS-RoPE")
+    if k.shape != q.shape and _native_rms_rope_layout(k, freqs_cis, extension_op="rms_rope1", rot_dim=rot_dim) is None:
+        return ValidationResult.fail("k", "CUDA fused RMS-RoPE requires a supported native layout")
+    if q_scale.ndim != 1 or q_scale.numel() != q.shape[-1]:
+        return ValidationResult.fail("q_scale", "must be a 1D tensor matching q head_dim")
+    if k_scale.ndim != 1 or k_scale.numel() != k.shape[-1]:
+        return ValidationResult.fail("k_scale", "must be a 1D tensor matching k head_dim")
+    if k.shape == q.shape and k_scale.dtype != q_scale.dtype:
+        return ValidationResult.fail("k_scale", "must match q_scale dtype for fused CUDA RMS-RoPE")
+    return ValidationResult.ok()
+
+
+def _native_rms_rope_layout(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    *,
+    extension_op: str,
+    rot_dim: int = 0,
+) -> bool | None:
+    bnhd = detect_rms_rope_bnhd(x, freqs_cis, rot_dim=rot_dim)
+    if bnhd is None or not (
+        _C is not None
+        and hasattr(_C, extension_op)
+        and x.shape[-1] >= 32
+        and x.shape[-1] % 32 == 0
+        and x.dtype in (torch.float16, torch.bfloat16)
+    ):
+        return None
+    return bnhd
+
+
+def _rms_rope1_cuda(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    scale: torch.Tensor,
+    epsilon: float,
+    *,
+    split_half: bool,
+    inplace: bool,
+) -> torch.Tensor:
+    assert _native_rms_rope_layout(x, freqs_cis, extension_op="rms_rope1") is not None
+
+    out = x if inplace else torch.empty_like(x)
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
-
-    _C.apply_rope(
+    _C.rms_rope1(
         _wrap_for_dlpack(x),
         _wrap_for_dlpack(freqs_cis),
-        _wrap_for_dlpack(x_out),
-        None,
-        None,
+        _wrap_for_dlpack(scale),
+        _wrap_for_dlpack(out),
+        epsilon,
         stream_ptr,
-        True,
+        split_half,
+    )
+    return out
+
+
+def _rms_rope_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None,
+    epsilon: float,
+    *,
+    split_half: bool,
+    inplace: bool,
+    rot_dim: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if k_scale is None:
+        k_scale = q_scale
+
+    if q.shape != k.shape:
+        if rot_dim:
+            fallback = (_eager_rope.rms_rope_split_half_ if inplace
+                        else _eager_rope.rms_rope_split_half)
+            return fallback(q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim=rot_dim)
+        return (
+            _rms_rope1_cuda(
+                q, freqs_cis, q_scale, epsilon,
+                split_half=split_half, inplace=inplace,
+            ),
+            _rms_rope1_cuda(
+                k, freqs_cis, k_scale, epsilon,
+                split_half=split_half, inplace=inplace,
+            ),
+        )
+
+    assert _native_rms_rope_layout(q, freqs_cis, extension_op="rms_rope", rot_dim=rot_dim) is not None
+
+    q_out = q if inplace else torch.empty_like(q)
+    k_out = k if inplace else torch.empty_like(k)
+    stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
+    _C.rms_rope(
+        _wrap_for_dlpack(q),
+        _wrap_for_dlpack(k),
+        _wrap_for_dlpack(freqs_cis),
+        _wrap_for_dlpack(q_scale),
+        _wrap_for_dlpack(k_scale),
+        _wrap_for_dlpack(q_out),
+        _wrap_for_dlpack(k_out),
+        epsilon,
+        stream_ptr,
+        split_half,
+        rot_dim,
+    )
+    return q_out, k_out
+
+
+def rms_rope1(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    scale: torch.Tensor,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    return _rms_rope1_cuda(x, freqs_cis, scale, epsilon, split_half=False, inplace=False)
+
+
+def rms_rope1_(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    scale: torch.Tensor,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    check_rope_inplace(x, readonly=(freqs_cis, scale))
+    return _rms_rope1_cuda(x, freqs_cis, scale, epsilon, split_half=False, inplace=True)
+
+
+def rms_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _rms_rope_cuda(
+        q, k, freqs_cis, q_scale, k_scale, epsilon,
+        split_half=False, inplace=False,
     )
 
-    return x_out
+
+def rms_rope_(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if k_scale is None:
+        k_scale = q_scale
+    check_rope_inplace(q, k, readonly=(freqs_cis, q_scale, k_scale))
+    return _rms_rope_cuda(
+        q, k, freqs_cis, q_scale, k_scale, epsilon,
+        split_half=False, inplace=True,
+    )
+
+
+def rms_rope_split_half1(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    scale: torch.Tensor,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    return _rms_rope1_cuda(x, freqs_cis, scale, epsilon, split_half=True, inplace=False)
+
+
+def rms_rope_split_half1_(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    scale: torch.Tensor,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    check_rope_inplace(x, readonly=(freqs_cis, scale))
+    return _rms_rope1_cuda(x, freqs_cis, scale, epsilon, split_half=True, inplace=True)
+
+
+def rms_rope_split_half(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+    rot_dim: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _rms_rope_cuda(
+        q, k, freqs_cis, q_scale, k_scale, epsilon,
+        split_half=True, inplace=False, rot_dim=rot_dim,
+    )
+
+
+def rms_rope_split_half_(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+    rot_dim: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if k_scale is None:
+        k_scale = q_scale
+    check_rope_inplace(q, k, readonly=(freqs_cis, q_scale, k_scale))
+    return _rms_rope_cuda(
+        q, k, freqs_cis, q_scale, k_scale, epsilon,
+        split_half=True, inplace=True, rot_dim=rot_dim,
+    )
+
+
+
+def apply_rope_split_half1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    return _apply_rope1_cuda(x, freqs_cis, split_half=True, inplace=False)
+
+
+def apply_rope_split_half1_(
+    x: torch.Tensor, freqs_cis: torch.Tensor
+) -> torch.Tensor:
+    check_rope_inplace(x, readonly=(freqs_cis,))
+    return _apply_rope1_cuda(x, freqs_cis, split_half=True, inplace=True)
 
 
 def apply_rope_split_half(
@@ -1790,31 +2304,16 @@ def apply_rope_split_half(
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if xq.shape != xk.shape:
-        return apply_rope_split_half1(xq, freqs_cis), apply_rope_split_half1(xk, freqs_cis)
+    return _apply_rope_cuda(xq, xk, freqs_cis, split_half=True, inplace=False)
 
-    if not xq.is_contiguous():
-        xq = xq.contiguous()
-    if not xk.is_contiguous():
-        xk = xk.contiguous()
-    if not freqs_cis.is_contiguous():
-        freqs_cis = freqs_cis.contiguous()
 
-    xq_out = torch.empty_like(xq)
-    xk_out = torch.empty_like(xk)
-    stream_ptr = torch.cuda.current_stream(xq.device).cuda_stream
-
-    _C.apply_rope(
-        _wrap_for_dlpack(xq),
-        _wrap_for_dlpack(freqs_cis),
-        _wrap_for_dlpack(xq_out),
-        _wrap_for_dlpack(xk),
-        _wrap_for_dlpack(xk_out),
-        stream_ptr,
-        True,
-    )
-
-    return xq_out, xk_out
+def apply_rope_split_half_(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    check_rope_inplace(xq, xk, readonly=(freqs_cis,))
+    return _apply_rope_cuda(xq, xk, freqs_cis, split_half=True, inplace=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2143,6 +2642,19 @@ def _build_constraints() -> dict:
                 ),
             },
             default_devices=cuda_devices,
+        ),        "rms_adaln": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+                "scale": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+                "shift": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+            },
+            default_devices=cuda_devices,
         ),
         "quantize_per_tensor_fp8": FunctionConstraints(
             params={
@@ -2252,6 +2764,94 @@ def _build_constraints() -> dict:
                 ),
             },
             default_devices=cuda_devices,
+        ),
+        "rms_rope": FunctionConstraints(
+            params={
+                "q": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+                "k": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+                "freqs_cis": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(6),),
+                ),
+                "q_scale": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(1),),
+                ),
+                "k_scale": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(1),),
+                ),
+            },
+            default_devices=cuda_devices,
+            call_rules=(_validate_cuda_rms_rope,),
+        ),
+        "rms_rope1": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+                "freqs_cis": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(6),),
+                ),
+                "scale": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(1),),
+                ),
+            },
+            default_devices=cuda_devices,
+            call_rules=(_validate_cuda_rms_rope1,),
+        ),
+        "rms_rope_split_half": FunctionConstraints(
+            params={
+                "q": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+                "k": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+                "freqs_cis": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(6),),
+                ),
+                "q_scale": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(1),),
+                ),
+                "k_scale": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(1),),
+                ),
+            },
+            default_devices=cuda_devices,
+            call_rules=(_validate_cuda_rms_rope,),
+        ),
+        "rms_rope_split_half1": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+                "freqs_cis": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(6),),
+                ),
+                "scale": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(1),),
+                ),
+            },
+            default_devices=cuda_devices,
+            call_rules=(_validate_cuda_rms_rope1,),
         ),
         "quantize_int8_tensorwise": FunctionConstraints(
             params={
@@ -2549,6 +3149,17 @@ def _build_constraints() -> dict:
             min_compute_capability=(10, 0),
         )
 
+    for inplace_name, functional_name in {
+        "apply_rope_": "apply_rope",
+        "apply_rope1_": "apply_rope1",
+        "apply_rope_split_half_": "apply_rope_split_half",
+        "apply_rope_split_half1_": "apply_rope_split_half1",
+        "rms_rope_": "rms_rope",
+        "rms_rope1_": "rms_rope1",
+        "rms_rope_split_half_": "rms_rope_split_half",
+        "rms_rope_split_half1_": "rms_rope_split_half1",
+    }.items():
+        constraints[inplace_name] = constraints[functional_name]
     return constraints
 
 

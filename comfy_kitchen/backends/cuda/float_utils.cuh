@@ -17,6 +17,7 @@
 #ifndef COMFY_FLOAT_UTILS_CUH_
 #define COMFY_FLOAT_UTILS_CUH_
 
+#include <cuda.h>
 #include <cuda_fp8.h>
 #if CUDA_VERSION >= 12080
 #include <cuda_fp4.h>

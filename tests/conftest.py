@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -11,6 +13,31 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "cupy: mark test as requiring CuPy")
 
 
+def pytest_sessionfinish(session, exitstatus):
+    # ROCm on Windows: pytest can hang at exit if HIP kernels left pending GPU
+    # work. See https://github.com/ROCm/TheRock/issues/999
+    torch = sys.modules.get("torch")
+    if sys.platform == "win32" and torch is not None:
+        if torch.cuda.is_available() and getattr(torch.version, "hip", None):
+            torch.cuda.synchronize()
+
+
+def cuda_backend_available() -> bool:
+    """Whether the compiled CUDA backend is loadable.
+
+    Not torch.cuda.is_available(): PyTorch reports ROCm devices as "cuda", so on
+    a ROCm build that is True with no CUDA extension present. Tests that drive
+    the CUDA backend specifically must gate on this or they fail instead of
+    skipping. On a CUDA box the two are equivalent.
+    """
+    return ck.list_backends().get("cuda", {}).get("available", False)
+
+
+requires_cuda_backend = pytest.mark.skipif(
+    not cuda_backend_available(), reason="compiled CUDA backend required"
+)
+
+
 @pytest.fixture(scope="session")
 def cuda_available():
     return torch.cuda.is_available()
@@ -21,17 +48,28 @@ def seed():
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(42)
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.manual_seed(42)
     yield
 
 
 @pytest.fixture
 def device(cuda_available):
-    return "cuda" if cuda_available else "cpu"
+    if cuda_available:
+        return "cuda"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
+    return "cpu"
 
 
 @pytest.fixture
 def small_tensor(cuda_available):
-    device = "cuda" if cuda_available else "cpu"
+    if cuda_available:
+        device = "cuda"
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        device = "xpu"
+    else:
+        device = "cpu"
     return torch.randn(128, 128, device=device, dtype=torch.float32)
 
 

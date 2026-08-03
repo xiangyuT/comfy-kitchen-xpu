@@ -11,10 +11,15 @@ from comfy_kitchen.registry import registry
 
 __all__ = [
     "adaln",
+    "rms_adaln",
     "apply_rope",
+    "apply_rope_",
     "apply_rope1",
+    "apply_rope1_",
     "apply_rope_split_half",
+    "apply_rope_split_half_",
     "apply_rope_split_half1",
+    "apply_rope_split_half1_",
     "convrot_w4a4_linear",
     "dequantize_convrot_w4a4_weight",
     "dequantize_gguf",
@@ -32,6 +37,14 @@ __all__ = [
     "quantize_int8_tensorwise",
     "quantize_convrot_w4a4_weight",
     "quantize_per_tensor_fp8",
+    "rms_rope",
+    "rms_rope_",
+    "rms_rope1",
+    "rms_rope1_",
+    "rms_rope_split_half",
+    "rms_rope_split_half_",
+    "rms_rope_split_half1",
+    "rms_rope_split_half1_",
     "quantize_svdquant_w4a4",
     "scaled_mm_svdquant_w4a4",
     "svdquant_w4a16_linear",
@@ -49,6 +62,7 @@ _NORM_AVAILABLE = False
 _FP8_AVAILABLE = False
 _FP8_QDQ_AVAILABLE = False
 _ROPE_AVAILABLE = False
+_RMS_ROPE_AVAILABLE = False
 _CONVROT_NATIVE_AVAILABLE = False
 _GGUF_AVAILABLE = False
 
@@ -132,6 +146,10 @@ try:
                 "apply_kitchen_rope_split_half1",
             )
         )
+        _RMS_ROPE_AVAILABLE = _native_rotary is not None and all(
+            hasattr(_native_rotary, name)
+            for name in ("rms_kitchen_rope", "rms_kitchen_rope1")
+        )
         _CONVROT_NATIVE_AVAILABLE = _native_int8 is not None and all(
             hasattr(_native_int8, name)
             for name in (
@@ -166,7 +184,7 @@ if _AVAILABLE:
         dequantize_int8_convrot_weight = _int8.dequantize_int8_convrot_weight
 
     if _NORM_AVAILABLE:
-        from .adaln import adaln
+        from .adaln import adaln, rms_adaln
 
     if _SVDQ_AVAILABLE:
         from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
@@ -182,7 +200,28 @@ if _AVAILABLE:
         )
 
     if _ROPE_AVAILABLE:
-        from .rope import apply_rope, apply_rope1, apply_rope_split_half, apply_rope_split_half1
+        from .rope import (
+            apply_rope,
+            apply_rope_,
+            apply_rope1,
+            apply_rope1_,
+            apply_rope_split_half,
+            apply_rope_split_half_,
+            apply_rope_split_half1,
+            apply_rope_split_half1_,
+        )
+
+    if _RMS_ROPE_AVAILABLE:
+        from .rope import (
+            rms_rope,
+            rms_rope_,
+            rms_rope1,
+            rms_rope1_,
+            rms_rope_split_half,
+            rms_rope_split_half_,
+            rms_rope_split_half1,
+            rms_rope_split_half1_,
+        )
 
     if _CONVROT_NATIVE_AVAILABLE and _SVDQ_AVAILABLE:
         from .convrot_w4a4 import (
@@ -271,6 +310,7 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
                 "out_dtype": ParamConstraint(dtypes=floats),
                 "convrot": ParamConstraint(dtypes=frozenset({bool})),
                 "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "input_act": ParamConstraint(dtypes=frozenset({str, type(None)})),
             },
             default_devices=xpu,
         ),
@@ -385,6 +425,15 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
             },
             default_devices=xpu,
         )
+        if _native_norm is not None and hasattr(_native_norm, "fused_rms_adaln"):
+            capabilities["rms_adaln"] = FunctionConstraints(
+                params={
+                    "x": ParamConstraint(dtypes=floats),
+                    "scale": ParamConstraint(dtypes=floats),
+                    "shift": ParamConstraint(dtypes=floats),
+                },
+                default_devices=xpu,
+            )
     if _FP8_QDQ_AVAILABLE:
         fp8_dtypes = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
         capabilities.update(
@@ -448,6 +497,64 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
                 ),
             }
         )
+        for inplace_name, functional_name in {
+            "apply_rope_": "apply_rope",
+            "apply_rope1_": "apply_rope1",
+            "apply_rope_split_half_": "apply_rope_split_half",
+            "apply_rope_split_half1_": "apply_rope_split_half1",
+        }.items():
+            capabilities[inplace_name] = capabilities[functional_name]
+    if _RMS_ROPE_AVAILABLE:
+        rope_input = ParamConstraint(dtypes=floats, shape_rules=(ExactDims(4),))
+        rope_freqs = ParamConstraint(dtypes=floats, shape_rules=(ExactDims(6),))
+        rope_scale = ParamConstraint(dtypes=floats, shape_rules=(ExactDims(1),))
+        capabilities.update(
+            {
+                "rms_rope1": FunctionConstraints(
+                    params={
+                        "x": rope_input,
+                        "freqs_cis": rope_freqs,
+                        "scale": rope_scale,
+                    },
+                    default_devices=xpu,
+                ),
+                "rms_rope": FunctionConstraints(
+                    params={
+                        "q": rope_input,
+                        "k": rope_input,
+                        "freqs_cis": rope_freqs,
+                        "q_scale": rope_scale,
+                        "k_scale": rope_scale,
+                    },
+                    default_devices=xpu,
+                ),
+                "rms_rope_split_half1": FunctionConstraints(
+                    params={
+                        "x": rope_input,
+                        "freqs_cis": rope_freqs,
+                        "scale": rope_scale,
+                    },
+                    default_devices=xpu,
+                ),
+                "rms_rope_split_half": FunctionConstraints(
+                    params={
+                        "q": rope_input,
+                        "k": rope_input,
+                        "freqs_cis": rope_freqs,
+                        "q_scale": rope_scale,
+                        "k_scale": rope_scale,
+                    },
+                    default_devices=xpu,
+                ),
+            }
+        )
+        for inplace_name, functional_name in {
+            "rms_rope_": "rms_rope",
+            "rms_rope1_": "rms_rope1",
+            "rms_rope_split_half_": "rms_rope_split_half",
+            "rms_rope_split_half1_": "rms_rope_split_half1",
+        }.items():
+            capabilities[inplace_name] = capabilities[functional_name]
     if _CONVROT_NATIVE_AVAILABLE and _SVDQ_AVAILABLE:
         capabilities.update(
             {

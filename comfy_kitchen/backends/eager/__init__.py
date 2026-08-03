@@ -1,9 +1,22 @@
 __all__ = [
     "adaln",
+    "rms_adaln",
     "apply_rope",
+    "apply_rope_",
     "apply_rope1",
+    "apply_rope1_",
     "apply_rope_split_half",
+    "apply_rope_split_half_",
     "apply_rope_split_half1",
+    "apply_rope_split_half1_",
+    "rms_rope",
+    "rms_rope_",
+    "rms_rope1",
+    "rms_rope1_",
+    "rms_rope_split_half",
+    "rms_rope_split_half_",
+    "rms_rope_split_half1",
+    "rms_rope_split_half1_",
     "dequantize_mxfp8",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
@@ -11,6 +24,7 @@ __all__ = [
     "dequantize_int8_simple_dtype",
     "dequantize_int8_convrot_weight",
     "dequantize_int8_convrot_weight_dtype",
+    "dequantize_int8_embedding",
     "dequantize_convrot_w4a4_weight",
     "dequantize_gguf",
     "gemv_awq_w4a16",
@@ -43,7 +57,7 @@ from comfy_kitchen.constraints import (
 )
 from comfy_kitchen.registry import registry
 
-from .adaln import adaln
+from .adaln import adaln, rms_adaln
 from .awq import gemv_awq_w4a16
 from .convrot_w4a4 import (
     convrot_w4a4_linear,
@@ -55,6 +69,7 @@ from .gguf import dequantize_gguf
 from .quantization import (
     dequantize_int8_convrot_weight,
     dequantize_int8_convrot_weight_dtype,
+    dequantize_int8_embedding,
     dequantize_int8_simple,
     dequantize_int8_simple_dtype,
     dequantize_mxfp8,
@@ -73,7 +88,24 @@ from .quantization import (
     scaled_mm_nvfp4,
     stochastic_rounding_fp8,
 )
-from .rope import apply_rope, apply_rope1, apply_rope_split_half, apply_rope_split_half1
+from .rope import (
+    apply_rope,
+    apply_rope1,
+    apply_rope1_,
+    apply_rope_,
+    apply_rope_split_half,
+    apply_rope_split_half1,
+    apply_rope_split_half1_,
+    apply_rope_split_half_,
+    rms_rope,
+    rms_rope1,
+    rms_rope1_,
+    rms_rope_,
+    rms_rope_split_half,
+    rms_rope_split_half1,
+    rms_rope_split_half1_,
+    rms_rope_split_half_,
+)
 from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
 from .svdquant_w4a16 import svdquant_w4a16_linear
 
@@ -85,6 +117,14 @@ def _build_constraints() -> dict:
 
     out = {
         "adaln": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "scale": ParamConstraint(dtypes=standard_floats),
+                "shift": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        "rms_adaln": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
                 "scale": ParamConstraint(dtypes=standard_floats),
@@ -189,6 +229,74 @@ def _build_constraints() -> dict:
                 "xq": ParamConstraint(dtypes=standard_floats),
                 "xk": ParamConstraint(dtypes=standard_floats),
                 "freqs_cis": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        "rms_rope": FunctionConstraints(
+            params={
+                "q": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(4),),
+                ),
+                "k": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(4),),
+                ),
+                "freqs_cis": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(6),),
+                ),
+                "q_scale": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(1),),
+                ),
+                "k_scale": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(1),),
+                ),
+            },
+            default_devices=all_devices,
+        ),
+        "rms_rope1": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(4),),
+                ),
+                "freqs_cis": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(6),),
+                ),
+                "scale": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(1),),
+                ),
+            },
+            default_devices=all_devices,
+        ),
+        "rms_rope_split_half": FunctionConstraints(
+            params={
+                "q": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(4),),
+                ),
+                "k": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(4),),
+                ),
+                "freqs_cis": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(6),),
+                ),
+                "q_scale": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(1),),
+                ),
+                "k_scale": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(1),),
+                ),
+            },
+            default_devices=all_devices,
+        ),
+        "rms_rope_split_half1": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(4),),
+                ),
+                "freqs_cis": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(6),),
+                ),
+                "scale": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(1),),
+                ),
             },
             default_devices=all_devices,
         ),
@@ -372,6 +480,16 @@ def _build_constraints() -> dict:
         },
         default_devices=all_devices,
     )
+    out["dequantize_int8_embedding"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
+            "scale": ParamConstraint(dtypes=standard_floats),
+            "indices": ParamConstraint(dtypes=frozenset({torch.int64, torch.int32})),
+            "group_size": ParamConstraint(dtypes=frozenset({int})),
+            "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
     out["dequantize_int8_simple"] = FunctionConstraints(
         params={
             "q": ParamConstraint(dtypes=frozenset({torch.int8})),
@@ -449,6 +567,17 @@ def _build_constraints() -> dict:
                 },
                 default_devices=all_devices)
 
+    for inplace_name, functional_name in {
+        "apply_rope_": "apply_rope",
+        "apply_rope1_": "apply_rope1",
+        "apply_rope_split_half_": "apply_rope_split_half",
+        "apply_rope_split_half1_": "apply_rope_split_half1",
+        "rms_rope_": "rms_rope",
+        "rms_rope1_": "rms_rope1",
+        "rms_rope_split_half_": "rms_rope_split_half",
+        "rms_rope_split_half1_": "rms_rope_split_half1",
+    }.items():
+        out[inplace_name] = out[functional_name]
     return out
 
 

@@ -1,4 +1,13 @@
-"""Native smoke and parity tests for the optional omni XPU backend."""
+"""Native smoke and parity tests for the optional omni XPU backend.
+
+Executable contract baseline: Comfy Kitchen v0.2.26 at
+255a43879fe57bbcbecfdb273b46d772b00c5a90.  XPU-specific ports live here so
+upstream's generic CUDA/Triton/eager tests remain easy to resync.  In
+particular, the RMS-RoPE cases mirror ``TestPartialRotary`` in
+``test_rms_rope.py`` and the activation cases mirror ``TestInputActQuantizer``,
+``TestInt8LinearInputAct``, and ``TestSwiGLUInputAct`` in
+``test_int8_input_act.py``.
+"""
 
 import pytest
 import torch
@@ -56,6 +65,18 @@ def test_xpu_adaln_unsupported_hidden_size_falls_back_safely():
     torch.testing.assert_close(actual, expected)
 
 
+def test_xpu_rms_adaln_matches_reference():
+    x = torch.randn(2, 16, 128, device="xpu", dtype=torch.bfloat16)
+    scale = torch.randn(2, 1, 128, device="xpu", dtype=torch.bfloat16) * 0.1
+    shift = torch.randn_like(scale) * 0.1
+
+    with ck.use_backend("xpu"):
+        actual = ck.rms_adaln(x, scale, shift)
+    expected = torch.nn.functional.rms_norm(x.float(), (128,), eps=1e-6)
+    expected = (expected * (1 + scale.float()) + shift.float()).to(x.dtype)
+    torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.03)
+
+
 @pytest.mark.parametrize("split_half", [False, True])
 @pytest.mark.parametrize("layout", ["BHND", "BNHD"])
 def test_xpu_rope_arbitrary_matrix_pair_semantics(split_half, layout):
@@ -79,6 +100,61 @@ def test_xpu_rope_arbitrary_matrix_pair_semantics(split_half, layout):
         rtol = atol = 0.07 if freqs.dtype == torch.bfloat16 else 1e-3
     torch.testing.assert_close(actual_q, expected_q, rtol=rtol, atol=atol)
     torch.testing.assert_close(actual_k, expected_k, rtol=rtol, atol=atol)
+
+
+def test_xpu_h3_packed_qkv_partial_rms_rope_inplace():
+    sequence, heads, head_dim, rot_dim = 37, 56, 128, 96
+    inner = heads * head_dim
+    packed = torch.randn(
+        sequence,
+        3 * inner,
+        device="xpu",
+        dtype=torch.bfloat16,
+    )
+    q = packed[:, :inner].view(1, sequence, heads, head_dim)
+    k = packed[:, inner : 2 * inner].view(1, sequence, heads, head_dim)
+    q_reference = q.clone()
+    k_reference = k.clone()
+    q_scale = torch.randn(head_dim, device="xpu", dtype=torch.float32)
+    k_scale = torch.randn(head_dim, device="xpu", dtype=torch.float32)
+    freqs = torch.randn(
+        1,
+        sequence,
+        1,
+        rot_dim // 2,
+        2,
+        2,
+        device="xpu",
+        dtype=torch.bfloat16,
+    )
+    q_pointer, k_pointer = q.data_ptr(), k.data_ptr()
+
+    with ck.use_backend("xpu"):
+        q_out, k_out = ck.rms_rope_split_half_(
+            q,
+            k,
+            freqs,
+            q_scale,
+            k_scale,
+            epsilon=1e-5,
+            rot_dim=rot_dim,
+        )
+    with ck.use_backend("eager"):
+        q_expected, k_expected = ck.rms_rope_split_half(
+            q_reference,
+            k_reference,
+            freqs,
+            q_scale,
+            k_scale,
+            epsilon=1e-5,
+            rot_dim=rot_dim,
+        )
+
+    assert not q.is_contiguous()
+    assert q_out.data_ptr() == q_pointer
+    assert k_out.data_ptr() == k_pointer
+    torch.testing.assert_close(q_out, q_expected, rtol=0.02, atol=0.02)
+    torch.testing.assert_close(k_out, k_expected, rtol=0.02, atol=0.02)
 
 
 def test_xpu_rope_compile_fullgraph():
@@ -296,6 +372,113 @@ def test_xpu_int8_linear_single_row_bias_and_dtype(dtype):
     assert actual.dtype == dtype
     assert error.mean().item() < 0.15
     assert error.max().item() < 0.75
+
+
+def test_xpu_int8_linear_swiglu_input_act():
+    rows, hidden, output = 37, 256, 96
+    x = torch.randn(rows, 2 * hidden, device="xpu", dtype=torch.bfloat16)
+    weight = torch.randn(output, hidden, device="xpu", dtype=torch.bfloat16)
+    with ck.use_backend("xpu"):
+        qweight, scale = ck.quantize_int8_tensorwise(weight)
+        actual = ck.int8_linear(
+            x,
+            qweight,
+            scale,
+            out_dtype=torch.bfloat16,
+            input_act="swiglu",
+        )
+    gate, up = x.chunk(2, dim=-1)
+    activated = torch.nn.functional.silu(gate).mul(up)
+    with ck.use_backend("xpu"):
+        expected = ck.int8_linear(
+            activated,
+            qweight,
+            scale,
+            out_dtype=torch.bfloat16,
+        )
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+
+
+def test_xpu_int8_linear_gelu_input_act_uses_fused_boundary(monkeypatch):
+    """The no-ConvRot GELU route must not materialize a floating activation."""
+    from omni_xpu_kernel import int8 as omni_int8
+
+    batch, tokens, hidden, output = 2, 17, 256, 96
+    x = torch.randn(batch, tokens, hidden, device="xpu", dtype=torch.bfloat16)
+    weight = torch.randn(output, hidden, device="xpu", dtype=torch.bfloat16)
+    with ck.use_backend("xpu"):
+        qweight, scale = ck.quantize_int8_tensorwise(weight)
+        x_int8, x_scale = omni_int8.fused_gelu_tanh_quantize_rowwise(x)
+        expected = omni_int8.int8_linear_prequantized(
+            x_int8,
+            x_scale,
+            qweight,
+            scale,
+            out_dtype=torch.bfloat16,
+        )
+
+        def reject_materialized_activation(*_args, **_kwargs):
+            raise AssertionError("gelu_tanh materialized a floating activation")
+
+        monkeypatch.setattr(
+            omni_int8, "_apply_input_act", reject_materialized_activation
+        )
+        actual = ck.int8_linear(
+            x,
+            qweight,
+            scale,
+            out_dtype=torch.bfloat16,
+            input_act="gelu_tanh",
+        )
+    assert actual.shape == (batch, tokens, output)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_xpu_int8_linear_gelu_convrot_fallback_matches_explicit_activation():
+    """ConvRot still applies GELU exactly once before its existing quantizer."""
+    rows, hidden, output = 37, 256, 96
+    x = torch.randn(rows, hidden, device="xpu", dtype=torch.bfloat16)
+    weight = torch.randn(output, hidden, device="xpu", dtype=torch.bfloat16)
+    with ck.use_backend("xpu"):
+        qweight, scale = ck.quantize_int8_tensorwise(weight)
+        actual = ck.int8_linear(
+            x,
+            qweight,
+            scale,
+            out_dtype=torch.bfloat16,
+            convrot=True,
+            convrot_groupsize=256,
+            input_act="gelu_tanh",
+        )
+        expected = ck.int8_linear(
+            torch.nn.functional.gelu(x, approximate="tanh"),
+            qweight,
+            scale,
+            out_dtype=torch.bfloat16,
+            convrot=True,
+            convrot_groupsize=256,
+        )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_xpu_int8_linear_input_act_identity_and_rejects_unknown():
+    """None/none are identical and unsupported activation names fail clearly."""
+    rows, hidden, output = 17, 256, 64
+    x = torch.randn(rows, hidden, device="xpu", dtype=torch.bfloat16)
+    weight = torch.randn(output, hidden, device="xpu", dtype=torch.bfloat16)
+    with ck.use_backend("xpu"):
+        qweight, scale = ck.quantize_int8_tensorwise(weight)
+        omitted = ck.int8_linear(x, qweight, scale, out_dtype=torch.bfloat16)
+        explicit_none = ck.int8_linear(
+            x, qweight, scale, out_dtype=torch.bfloat16, input_act=None
+        )
+        named_none = ck.int8_linear(
+            x, qweight, scale, out_dtype=torch.bfloat16, input_act="none"
+        )
+        with pytest.raises(ValueError, match="unsupported input_act"):
+            ck.int8_linear(x, qweight, scale, input_act="silu")
+    assert torch.equal(omitted, explicit_none)
+    assert torch.equal(omitted, named_none)
 
 
 def test_xpu_int8_quantized_tensor_lifecycle_and_linear():
