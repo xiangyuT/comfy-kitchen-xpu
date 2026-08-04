@@ -102,9 +102,11 @@ def test_xpu_rope_arbitrary_matrix_pair_semantics(split_half, layout):
     torch.testing.assert_close(actual_k, expected_k, rtol=rtol, atol=atol)
 
 
-def test_xpu_h3_packed_qkv_partial_rms_rope_inplace():
+@pytest.mark.parametrize("scale_dtype", [torch.float32, torch.bfloat16])
+def test_xpu_h3_packed_qkv_partial_rms_rope_inplace(scale_dtype):
     sequence, heads, head_dim, rot_dim = 37, 56, 128, 96
     inner = heads * head_dim
+    torch.xpu.manual_seed_all(20260804)
     packed = torch.randn(
         sequence,
         3 * inner,
@@ -115,8 +117,8 @@ def test_xpu_h3_packed_qkv_partial_rms_rope_inplace():
     k = packed[:, inner : 2 * inner].view(1, sequence, heads, head_dim)
     q_reference = q.clone()
     k_reference = k.clone()
-    q_scale = torch.randn(head_dim, device="xpu", dtype=torch.float32)
-    k_scale = torch.randn(head_dim, device="xpu", dtype=torch.float32)
+    q_scale = torch.randn(head_dim, device="xpu", dtype=scale_dtype)
+    k_scale = torch.randn(head_dim, device="xpu", dtype=scale_dtype)
     freqs = torch.randn(
         1,
         sequence,
