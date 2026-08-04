@@ -11,7 +11,23 @@ from comfy_kitchen.tensor import TensorWiseINT8Layout
 
 from .conftest import (
     assert_values_close,
+    cuda_backend_available,
     get_capable_backends,
+)
+
+COMFYUI_NVIDIA_16_SERIES = (
+    "1660",
+    "1650",
+    "1630",
+    "T500",
+    "T550",
+    "T600",
+    "MX550",
+    "MX450",
+    "CMP 30HX",
+    "T2000",
+    "T1000",
+    "T1200",
 )
 
 
@@ -38,6 +54,55 @@ def test_cuda_int8_cublas_turing_n_alignment(monkeypatch):
     assert cuda._cublas_int8_n_alignment(tensor) == 32
     assert cuda._round_up(17, cuda._cublas_int8_n_alignment(tensor)) == 32
     assert calls == [0]
+
+
+def test_nvidia_16_series_list_matches_comfyui():
+    assert cuda._NVIDIA_16_SERIES == COMFYUI_NVIDIA_16_SERIES
+
+
+@pytest.mark.parametrize("device_name", COMFYUI_NVIDIA_16_SERIES)
+def test_turing_devices_without_tensor_cores_keep_fallback(device_name, monkeypatch):
+    cuda._turing_device_cache.clear()
+    cuda._nvidia_16_series_device_cache.clear()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device_index: (7, 5))
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device_index: f"NVIDIA {device_name}")
+
+    assert cuda._cuda_device_is_turing(0)
+    assert cuda._cuda_device_is_nvidia_16_series(0)
+    assert not cuda._cuda_device_should_use_turing_kernels(0)
+
+
+@pytest.mark.parametrize(
+    "device_name",
+    [
+        "NVIDIA GeForce RTX 2060",
+        "NVIDIA GeForce RTX 2080 Ti",
+        "NVIDIA Quadro RTX 5000",
+        "NVIDIA TITAN RTX",
+        "Tesla T4",
+    ],
+)
+def test_turing_tensor_core_devices_use_native_kernels(device_name, monkeypatch):
+    cuda._turing_device_cache.clear()
+    cuda._nvidia_16_series_device_cache.clear()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device_index: (7, 5))
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device_index: device_name)
+
+    assert not cuda._cuda_device_is_nvidia_16_series(0)
+    assert cuda._cuda_device_should_use_turing_kernels(0)
+
+
+@pytest.mark.parametrize(
+    "capability",
+    [(8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (12, 0)],
+)
+def test_non_turing_devices_never_use_turing_kernels(capability, monkeypatch):
+    cuda._turing_device_cache.clear()
+    cuda._nvidia_16_series_device_cache.clear()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device_index: capability)
+
+    assert not cuda._cuda_device_is_turing(0)
+    assert not cuda._cuda_device_should_use_turing_kernels(0)
 
 
 def test_eager_int8_matmul_turing_n_alignment(monkeypatch):
@@ -80,8 +145,8 @@ def test_public_mm_int8_uses_registry_on_cpu():
 
 def test_cuda_int8_linear_does_not_retain_scratch_tensors():
     """CUDA INT8 linear uses per-call temporaries instead of retained scratch caches."""
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
+    if not cuda_backend_available():
+        pytest.skip("compiled CUDA backend required")
 
     x = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
     weight = torch.randint(-128, 127, (64, 128), device="cuda", dtype=torch.int8)
@@ -94,6 +159,83 @@ def test_cuda_int8_linear_does_not_retain_scratch_tensors():
     assert not hasattr(cuda, "_int8_gemm_int32_scratch")
     assert not hasattr(cuda, "_int8_quant_scratch_tensors")
     assert not hasattr(cuda, "_int8_gemm_int32_scratch_tensor")
+
+
+def test_turing_fused_int8_shape_selection():
+    assert cuda._prefer_turing_fused_int8(128, 4096, 4096)
+    assert cuda._prefer_turing_fused_int8(512, 2048, 1024)
+    assert cuda._prefer_turing_fused_int8(1024, 4096, 2048)
+    assert not cuda._prefer_turing_fused_int8(512, 4096, 4096)
+    assert not cuda._prefer_turing_fused_int8(1024, 2048, 4096)
+
+
+@pytest.mark.parametrize("m", [64, 128, 512, 1024])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("scalar_weight_scale", [False, True])
+def test_turing_int8_fused_gemm_matches_reference(
+    seed,
+    m,
+    dtype,
+    with_bias,
+    scalar_weight_scale,
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if not hasattr(cuda._C, "cutlass_turing_int8_dequant"):
+        pytest.skip("CUDA extension was built without the Turing INT8 kernel")
+
+    n, k = 128, 256
+    activation = torch.randint(-127, 128, (m, k), device="cuda", dtype=torch.int8)
+    weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+    activation_scale = torch.rand(m, device="cuda", dtype=torch.float32)
+    weight_scale_shape = () if scalar_weight_scale else (n,)
+    weight_scale = torch.rand(weight_scale_shape, device="cuda", dtype=torch.float32)
+    bias = torch.randn(n, device="cuda", dtype=dtype) if with_bias else None
+
+    actual = cuda._int8_linear_turing_quantized(
+        activation,
+        weight,
+        activation_scale,
+        weight_scale,
+        bias,
+        dtype,
+    )
+    accumulator = activation.cpu().to(torch.int32) @ weight.cpu().to(torch.int32).T
+    expected = accumulator.to(device="cuda", dtype=torch.float32)
+    expected *= activation_scale.reshape(-1, 1)
+    expected *= weight_scale.reshape(1, -1)
+    if bias is not None:
+        expected += bias.float()
+    expected = expected.to(dtype)
+
+    assert actual is not None
+    tolerance = 2 * torch.finfo(dtype).eps
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+
+
+def test_int8_linear_routes_turing_to_fused_kernel(seed, monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if not hasattr(cuda._C, "cutlass_turing_int8_dequant"):
+        pytest.skip("CUDA extension was built without the Turing INT8 kernel")
+
+    x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randint(-127, 128, (128, 256), device="cuda", dtype=torch.int8)
+    weight_scale = torch.rand(128, device="cuda", dtype=torch.float32)
+    original = cuda._int8_linear_turing_quantized
+    calls = []
+
+    def record_call(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(cuda, "_cuda_device_is_turing", lambda _device_index: True)
+    monkeypatch.setattr(cuda, "_int8_linear_turing_quantized", record_call)
+    output = cuda.int8_linear(x, weight, weight_scale, out_dtype=torch.bfloat16)
+
+    assert output.shape == (128, 128)
+    assert calls == [True]
 
 
 # =============================================================================
@@ -120,8 +262,8 @@ def test_eager_int8_stochastic_rounding_tensorwise(seed):
 
 def test_cuda_int8_stochastic_rounding_seeded(seed):
     """CUDA stochastic INT8 rounding is seeded and unbiased."""
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
+    if not cuda_backend_available():
+        pytest.skip("compiled CUDA backend required")
 
     x = torch.full((4096,), 0.5, device="cuda", dtype=torch.float16)
     x[0] = 127.0
@@ -353,6 +495,8 @@ class TestTensorWiseINT8Layout:
 
     def test_int8_linear_cuda_single_row_gemv(self, seed):
         """CUDA int8_linear uses the single-row GEMV path correctly."""
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
         import comfy_kitchen as ck
         from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise
 
@@ -426,6 +570,8 @@ class TestTensorWiseINT8Layout:
 
     def test_dequantize_direct_output_dtype_matches_final_cast(self, seed):
         """Direct fp16/bf16 dequant output matches the prior float32-then-cast behavior."""
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
         import comfy_kitchen as ck
 
         x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
@@ -515,6 +661,8 @@ class TestTensorWiseINT8Layout:
 
     def test_convrot_weight_quantize_cuda_roundtrip(self, seed):
         """CUDA ConvRot weight quantization preserves the weight after inverse rotation."""
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
         from comfy_kitchen.backends import cuda as cuda_backend
         from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_weight
 
@@ -545,6 +693,38 @@ class TestTensorWiseINT8Layout:
 
         rel_err = (w.float() - dq.float()).abs() / (w.float().abs().max() + 1e-8)
         assert rel_err.mean().item() < 0.02
+
+    def test_convrot_int8_supports_65536_rows(self):
+        """INT8 and INT4 kernels put large row counts in CUDA's grid.x dimension."""
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
+        rows, cols = 1 << 16, 256
+        row = torch.linspace(-1.0, 1.0, cols, device="cuda", dtype=torch.bfloat16)
+        weight = row.expand(rows, cols).contiguous()
+
+        q_rowwise, scale_rowwise = cuda.quantize_int8_rowwise(weight)
+        dequantized_rowwise = cuda.dequantize_int8_simple_dtype(
+            q_rowwise, scale_rowwise, 2
+        )
+        assert torch.equal(dequantized_rowwise[0], dequantized_rowwise[-1])
+
+        rotated = cuda.rotate_int8_convrot_weight(weight, 256)
+        assert torch.equal(rotated[0], rotated[-1])
+
+        q, scale = cuda.quantize_int8_convrot_staged(weight, 256)
+        assert torch.equal(q[0], q[-1])
+        assert torch.equal(scale[0], scale[-1])
+
+        dequantized = cuda.dequantize_int8_convrot_weight_dtype(q, scale, 256, 2)
+        assert torch.equal(dequantized[0], dequantized[-1])
+
+        q_int4, scale_int4 = cuda.quantize_int4_rowwise_convrot64(weight, 256)
+        dequantized_int4 = cuda.dequantize_convrot_w4a4_weight(
+            q_int4,
+            scale_int4.reshape(-1),
+            output_dtype=torch.bfloat16,
+        )
+        assert torch.equal(dequantized_int4[0], dequantized_int4[-1])
 
     def test_convrot_divisibility(self, seed):
         """Verify error when channels are not divisible by convrot_groupsize."""

@@ -1,9 +1,22 @@
 __all__ = [
     "adaln",
+    "rms_adaln",
     "apply_rope",
+    "apply_rope_",
     "apply_rope1",
+    "apply_rope1_",
     "apply_rope_split_half",
+    "apply_rope_split_half_",
     "apply_rope_split_half1",
+    "apply_rope_split_half1_",
+    "rms_rope",
+    "rms_rope_",
+    "rms_rope1",
+    "rms_rope1_",
+    "rms_rope_split_half",
+    "rms_rope_split_half_",
+    "rms_rope_split_half1",
+    "rms_rope_split_half1_",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
     "quantize_mxfp8",
@@ -45,7 +58,7 @@ try:
         quantize_int8_rowwise as _eager_quantize_int8_rowwise,
     )
 
-    from .adaln import adaln
+    from .adaln import adaln, rms_adaln
     from .quantization import (
         dequantize_nvfp4,
         dequantize_per_tensor_fp8,
@@ -60,7 +73,26 @@ try:
     from .quantization import (
         triton_quantize_rowwise as _triton_quantize_int8_rowwise,
     )
-    from .rope import apply_rope, apply_rope1, apply_rope_split_half, apply_rope_split_half1
+    from .rms_rope import (
+        rms_rope,
+        rms_rope1,
+        rms_rope1_,
+        rms_rope_,
+        rms_rope_split_half,
+        rms_rope_split_half1,
+        rms_rope_split_half1_,
+        rms_rope_split_half_,
+    )
+    from .rope import (
+        apply_rope,
+        apply_rope1,
+        apply_rope1_,
+        apply_rope_,
+        apply_rope_split_half,
+        apply_rope_split_half1,
+        apply_rope_split_half1_,
+        apply_rope_split_half_,
+    )
 except ImportError as e:
     _TRITON_AVAILABLE = False
     _TRITON_ERROR = f"ImportError: {e!s}"
@@ -93,8 +125,16 @@ def _build_constraints() -> dict:
     triton_devices = frozenset({"cuda", "xpu"})
     standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
 
-    return {
+    out = {
         "adaln": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "scale": ParamConstraint(dtypes=standard_floats),
+                "shift": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=triton_devices,
+        ),
+        "rms_adaln": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
                 "scale": ParamConstraint(dtypes=standard_floats),
@@ -172,6 +212,24 @@ def _build_constraints() -> dict:
             },
             default_devices=triton_devices,
         ),
+        "rms_rope1": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "freqs_cis": ParamConstraint(dtypes=standard_floats),
+                "scale": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=triton_devices,
+        ),
+        "rms_rope": FunctionConstraints(
+            params={
+                "q": ParamConstraint(dtypes=standard_floats),
+                "k": ParamConstraint(dtypes=standard_floats),
+                "freqs_cis": ParamConstraint(dtypes=standard_floats),
+                "q_scale": ParamConstraint(dtypes=standard_floats),
+                "k_scale": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=triton_devices,
+        ),
         "int8_linear": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
@@ -180,6 +238,7 @@ def _build_constraints() -> dict:
                 "out_dtype": ParamConstraint(dtypes=standard_floats),
                 "convrot": ParamConstraint(dtypes=frozenset({bool})),
                 "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "input_act": ParamConstraint(dtypes=frozenset({str, type(None)})),
             },
             default_devices=triton_devices,
             min_compute_capability=(8, 0),  # Required for Triton INT8 dot
@@ -215,7 +274,37 @@ def _build_constraints() -> dict:
             },
             default_devices=triton_devices,
         ),
+        "rms_rope_split_half1": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "freqs_cis": ParamConstraint(dtypes=standard_floats),
+                "scale": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=triton_devices,
+        ),
+        "rms_rope_split_half": FunctionConstraints(
+            params={
+                "q": ParamConstraint(dtypes=standard_floats),
+                "k": ParamConstraint(dtypes=standard_floats),
+                "freqs_cis": ParamConstraint(dtypes=standard_floats),
+                "q_scale": ParamConstraint(dtypes=standard_floats),
+                "k_scale": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=triton_devices,
+        ),
     }
+    for inplace_name, functional_name in {
+        "apply_rope_": "apply_rope",
+        "apply_rope1_": "apply_rope1",
+        "apply_rope_split_half_": "apply_rope_split_half",
+        "apply_rope_split_half1_": "apply_rope_split_half1",
+        "rms_rope_": "rms_rope",
+        "rms_rope1_": "rms_rope1",
+        "rms_rope_split_half_": "rms_rope_split_half",
+        "rms_rope_split_half1_": "rms_rope_split_half1",
+    }.items():
+        out[inplace_name] = out[functional_name]
+    return out
 
 
 def _register():

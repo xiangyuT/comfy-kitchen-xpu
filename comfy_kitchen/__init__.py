@@ -23,7 +23,6 @@ from .svdquant_w4a16 import (
     svdquant_w4a16_linear,
 )
 
-# Import registry and exceptions
 from .registry import registry
 from .tensor.convrot_w4a4 import (
     convrot_w4a4_linear,
@@ -31,10 +30,27 @@ from .tensor.convrot_w4a4 import (
     quantize_convrot_w4a4_weight,
 )
 
+# Loading the HIP extension also loads the ROCm runtime. Do that only under a
+# ROCm PyTorch build so CUDA/CPU processes do not pay the import cost or acquire
+# an unrelated GPU runtime merely because a combined wheel contains the module.
+if getattr(torch.version, "hip", None):
+    try:
+        from .backends import hip as _hip_backend  # noqa: F401
+    except ImportError as error:
+        registry.mark_unavailable("hip", f"HIP backend is not packaged ({error})")
+
+    # The HIP backend registers only on a supported AMD device (RDNA2/3/3.5/4),
+    # and advertises only the ops that device can run; prefer it where it registers.
+    if registry.is_available("hip"):
+        registry.set_priority(["hip", "cuda", "triton", "eager"])
+else:
+    registry.mark_unavailable("hip", "PyTorch ROCm/HIP runtime not available")
+
 __all__ = [
     "__version__",
     # Normalization
     "adaln",
+    "rms_adaln",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -64,9 +80,21 @@ __all__ = [
     "int8_linear",
     # Positional encoding
     "apply_rope",
+    "apply_rope_",
     "apply_rope1",
+    "apply_rope1_",
     "apply_rope_split_half",
+    "apply_rope_split_half_",
     "apply_rope_split_half1",
+    "apply_rope_split_half1_",
+    "rms_rope",
+    "rms_rope_",
+    "rms_rope1",
+    "rms_rope1_",
+    "rms_rope_split_half",
+    "rms_rope_split_half_",
+    "rms_rope_split_half1",
+    "rms_rope_split_half1_",
     # Utilities
     "swap_nibbles",
     "to_blocked",
@@ -109,6 +137,29 @@ def adaln(
         Normalized and modulated tensor with the same shape as x
     """
     return torch.ops.comfy_kitchen.adaln(x, scale, shift, eps)
+
+
+def rms_adaln(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Fused Adaptive Layer Normalization with RMSNorm: rmsnorm(x) * (1 + scale) + shift.
+
+    Same modulation as :func:`adaln`, but normalizing by the root mean square
+    instead of subtracting the mean — the form used by LTX/LTX2-style DiTs.
+
+    Args:
+        x: Input tensor of any shape (..., D)
+        scale: Modulation scale, broadcastable to x's shape
+        shift: Modulation shift, broadcastable to x's shape
+        eps: RMSNorm epsilon
+
+    Returns:
+        Normalized and modulated tensor with the same shape as x
+    """
+    return torch.ops.comfy_kitchen.rms_adaln(x, scale, shift, eps)
 
 
 def quantize_per_tensor_fp8(
@@ -444,6 +495,125 @@ def apply_rope(
     return torch.ops.comfy_kitchen.apply_rope(xq, xk, freqs_cis)
 
 
+def apply_rope_(
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply interleaved RoPE in place (inference only)."""
+    torch.ops.comfy_kitchen.apply_rope_(xq, xk, freqs_cis)
+    return xq, xk
+
+
+def rms_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply per-head RMSNorm followed by interleaved RoPE to query and key tensors.
+
+    Interleaved layout: pair k uses adjacent elements [2k, 2k+1].
+
+    Args:
+        q: Query tensor.
+        k: Key tensor. Its head count may differ from q for grouped-query attention.
+        freqs_cis: Precomputed frequency tensor.
+        q_scale: Per-dimension RMSNorm scale for q.
+        k_scale: Optional per-dimension RMSNorm scale for k. Defaults to q_scale.
+        epsilon: RMSNorm numerical-stability epsilon.
+
+    Returns:
+        Tuple of normalized and rotated (query, key) tensors.
+    """
+    return torch.ops.comfy_kitchen.rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon)
+
+
+def rms_rope_(
+    q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor, k_scale: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply RMSNorm and interleaved RoPE in place (inference only)."""
+    torch.ops.comfy_kitchen.rms_rope_(q, k, freqs_cis, q_scale, k_scale, epsilon)
+    return q, k
+
+
+def rms_rope1(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    scale: torch.Tensor,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    """Apply per-head RMSNorm followed by interleaved RoPE to a single tensor."""
+    return torch.ops.comfy_kitchen.rms_rope1(x, freqs_cis, scale, epsilon)
+
+
+def rms_rope1_(
+    x: torch.Tensor, freqs_cis: torch.Tensor, scale: torch.Tensor,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    """Apply RMSNorm and interleaved RoPE in place (inference only)."""
+    torch.ops.comfy_kitchen.rms_rope1_(x, freqs_cis, scale, epsilon)
+    return x
+
+
+def rms_rope_split_half(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+    rot_dim: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply per-head RMSNorm and split-half RoPE to query and key tensors.
+
+    Split-half layout: pair i uses elements [i] and [i + rot_dim//2]. rot_dim
+    restricts the rotation to a head-dim prefix (partial rotary; the norm
+    always spans the full head_dim); 0 rotates everything.
+    """
+    return torch.ops.comfy_kitchen.rms_rope_split_half(q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim)
+
+
+def rms_rope_split_half_(
+    q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor, k_scale: torch.Tensor | None = None,
+    epsilon: float = 1e-6, rot_dim: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply RMSNorm and split-half RoPE in place (inference only).
+
+    rot_dim restricts the rotation to a head-dim prefix (partial rotary; the
+    norm always spans the full head_dim); 0 rotates everything.
+    """
+    torch.ops.comfy_kitchen.rms_rope_split_half_(
+        q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim
+    )
+    return q, k
+
+
+def rms_rope_split_half1(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    scale: torch.Tensor,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    """Apply per-head RMSNorm followed by split-half RoPE to a single tensor.
+
+    Split-half layout: pair k uses elements [k] and [k + head_dim//2].
+    """
+    return torch.ops.comfy_kitchen.rms_rope_split_half1(x, freqs_cis, scale, epsilon)
+
+
+def rms_rope_split_half1_(
+    x: torch.Tensor, freqs_cis: torch.Tensor, scale: torch.Tensor,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    """Apply RMSNorm and split-half RoPE in place (inference only)."""
+    torch.ops.comfy_kitchen.rms_rope_split_half1_(x, freqs_cis, scale, epsilon)
+    return x
+
+
 def apply_rope1(
     x: torch.Tensor,
     freqs_cis: torch.Tensor,
@@ -460,6 +630,12 @@ def apply_rope1(
         Transformed tensor
     """
     return torch.ops.comfy_kitchen.apply_rope1(x, freqs_cis)
+
+
+def apply_rope1_(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    """Apply interleaved RoPE in place (inference only)."""
+    torch.ops.comfy_kitchen.apply_rope1_(x, freqs_cis)
+    return x
 
 
 def apply_rope_split_half(
@@ -486,6 +662,14 @@ def apply_rope_split_half(
     return torch.ops.comfy_kitchen.apply_rope_split_half(xq, xk, freqs_cis)
 
 
+def apply_rope_split_half_(
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply split-half RoPE in place (inference only)."""
+    torch.ops.comfy_kitchen.apply_rope_split_half_(xq, xk, freqs_cis)
+    return xq, xk
+
+
 def apply_rope_split_half1(
     x: torch.Tensor,
     freqs_cis: torch.Tensor,
@@ -506,6 +690,14 @@ def apply_rope_split_half1(
         Transformed tensor
     """
     return torch.ops.comfy_kitchen.apply_rope_split_half1(x, freqs_cis)
+
+
+def apply_rope_split_half1_(
+    x: torch.Tensor, freqs_cis: torch.Tensor
+) -> torch.Tensor:
+    """Apply split-half RoPE in place (inference only)."""
+    torch.ops.comfy_kitchen.apply_rope_split_half1_(x, freqs_cis)
+    return x
 
 
 def quantize_int8_tensorwise(
@@ -549,6 +741,7 @@ def int8_linear(
     out_dtype: torch.dtype | None = None,
     convrot: bool = False,
     convrot_groupsize: int = 256,
+    input_act: str | None = None,
 ) -> torch.Tensor:
     """INT8 linear layer dynamically quantized.
 
@@ -560,22 +753,29 @@ def int8_linear(
         out_dtype: Output dtype.
         convrot: If True, apply online activation rotation.
         convrot_groupsize: Group size for Hadamard rotation.
+        input_act: Optional elementwise activation applied to x before
+            quantization ("gelu_tanh", or None). When the fused ConvRot
+            quantizer handles the shape it is folded in, so an MLP's
+            ``linear(act(proj(x)))`` never writes act's output to HBM; every
+            other path applies it eagerly for identical results.
 
     Returns:
         Result tensor.
     """
     if out_dtype is None:
         out_dtype = torch.bfloat16
-    dtype_code = DTYPE_TO_CODE[out_dtype]
-    return torch.ops.comfy_kitchen.int8_linear(
-        x,
-        weight,
-        weight_scale,
-        bias,
-        dtype_code,
-        convrot,
-        convrot_groupsize,
-    )
+    kwargs = {
+        "x": x,
+        "weight": weight,
+        "weight_scale": weight_scale,
+        "bias": bias,
+        "out_dtype": out_dtype,
+        "convrot": convrot,
+        "convrot_groupsize": convrot_groupsize,
+        "input_act": input_act,
+    }
+    impl = registry.get_implementation("int8_linear", kwargs=kwargs)
+    return impl(**kwargs)
 
 
 # =============================================================================

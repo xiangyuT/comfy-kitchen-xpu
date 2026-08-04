@@ -23,8 +23,8 @@ the upstream maintainers and contributors for the library architecture,
 operator APIs, QuantizedTensor design, backend registry, eager/CUDA/Triton
 implementations, packaging, and tests on which this work is built.
 
-The XPU development line is based on upstream Comfy Kitchen `0.2.18` at
-[`898017e`](https://github.com/Comfy-Org/comfy-kitchen/commit/898017e5c0f23b5b7b9a8473746be6c419baffb3).
+The XPU development line is based on upstream Comfy Kitchen `0.2.26` at
+[`255a438`](https://github.com/Comfy-Org/comfy-kitchen/commit/255a43879fe57bbcbecfdb273b46d772b00c5a90).
 The Intel-specific work in this fork is intentionally optional: importing
 Comfy Kitchen remains safe when PyTorch XPU, `omni_xpu_kernel`, its native
 extension, or Intel GPU hardware is absent.
@@ -44,8 +44,9 @@ The original upstream CUDA and generic-backend README is retained
   `omni_xpu_kernel` before registering capabilities.
 - Intel implementations and adapters for INT8, INT8 ConvRot, FP8
   quantize/dequantize and stochastic rounding, SVDQuant W4A4, arbitrary-2x2
-  RoPE, AdaLN, ConvRot W4A4, FP8 W8A16, managed GGUF dequantization, and
-  Nunchaku-compatible SVDQuant W4A16 dispatch.
+  RoPE, fused RMSNorm+RoPE (including partial split-half in-place views), AdaLN,
+  RMS-AdaLN, fused SwiGLU+INT8 input quantization, ConvRot W4A4, FP8 W8A16,
+  managed GGUF dequantization, and Nunchaku-compatible SVDQuant W4A16 dispatch.
 - XPU-aware QuantizedTensor lifecycle, device migration, `linear`, `mm`,
   `addmm`, transpose, serialization, and prepared-weight paths.
 - Target-checked companion-wheel construction for BMG and PTL-H, including
@@ -125,7 +126,7 @@ git clone https://github.com/xiangyuT/comfy-kitchen-xpu.git
 cd comfy-kitchen-xpu
 python -m pip install build
 python -m build --wheel
-pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.18-py3-none-any.whl
+pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.26-py3-none-any.whl
 ```
 
 The repository retains upstream CUDA source to keep future upstream updates
@@ -192,7 +193,7 @@ revision/version and XPU target.
 ## Upstream README reference
 
 The following is the original upstream README content from
-[Comfy-Org/comfy-kitchen `0.2.18` at `898017e`](https://github.com/Comfy-Org/comfy-kitchen/blob/898017e5c0f23b5b7b9a8473746be6c419baffb3/README.md).
+[Comfy-Org/comfy-kitchen `0.2.26` at `255a438`](https://github.com/Comfy-Org/comfy-kitchen/blob/255a43879fe57bbcbecfdb273b46d772b00c5a90/README.md).
 It is retained here to preserve the CUDA, eager, Triton, installation, and
 generic backend documentation supplied by upstream.
 
@@ -205,18 +206,148 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 
 ## Backend Capabilities Matrix
 
-| Function                    | eager | cuda | triton |
-|-----------------------------|-------|------|--------|
-| `quantize_per_tensor_fp8`   | ✓     | ✓    | ✓      |
-| `dequantize_per_tensor_fp8` | ✓     | ✓    | ✓      |
-| `quantize_nvfp4`            | ✓     | ✓    | ✓      |
-| `dequantize_nvfp4`          | ✓     | ✓    |        |
-| `scaled_mm_nvfp4`           | ✓     | ✓    |        |
-| `quantize_mxfp8`            | ✓     | ✓    | ✓      |
-| `dequantize_mxfp8`          | ✓     |      |        |
-| `scaled_mm_mxfp8`           | ✓     |      |        |
-| `apply_rope`                | ✓     | ✓    | ✓      |
-| `apply_rope1`               | ✓     | ✓    | ✓      |
+| Function                    | eager | cuda | triton | hip |
+|-----------------------------|-------|------|--------|-----|
+| `quantize_per_tensor_fp8`   | ✓     | ✓    | ✓      | ✓   |
+| `dequantize_per_tensor_fp8` | ✓     | ✓    | ✓      | ✓   |
+| `stochastic_rounding_fp8`   | ✓     | ✓    |        | ✓   |
+| `quantize_nvfp4`            | ✓     | ✓    | ✓      |     |
+| `dequantize_nvfp4`          | ✓     | ✓    | ✓      |     |
+| `scaled_mm_nvfp4`           | ✓     | ✓    |        |     |
+| `quantize_mxfp8`            | ✓     | ✓    | ✓      |     |
+| `dequantize_mxfp8`          | ✓     |      |        |     |
+| `scaled_mm_mxfp8`           | ✓     |      |        |     |
+| `adaln`                     | ✓     | ✓    | ✓      | ✓   |
+| `rms_adaln`                 | ✓     | ✓    | ✓      | ✓   |
+| `apply_rope`                | ✓     | ✓    | ✓      | ✓   |
+| `apply_rope1`               | ✓     | ✓    | ✓      | ✓   |
+| `apply_rope_split_half`     | ✓     | ✓    | ✓      | ✓   |
+| `apply_rope_split_half1`    | ✓     | ✓    | ✓      | ✓   |
+| `rms_rope`                  | ✓     | ✓    | ✓      | ✓   |
+| `rms_rope1`                 | ✓     | ✓    | ✓      | ✓   |
+| `rms_rope_split_half`       | ✓     | ✓    | ✓      | ✓   |
+| `rms_rope_split_half1`      | ✓     | ✓    | ✓      | ✓   |
+| `quantize_int8_rowwise`     | ✓     | ✓    | ✓      | ✓   |
+| `quantize_int8_tensorwise`  | ✓     | ✓    |        | ✓   |
+| `quantize_and_rotate_rowwise` | ✓   | ✓    | ✓      | ✓   |
+| `quantize_int8_convrot_weight` | ✓  | ✓    |        | ✓   |
+| `dequantize_int8_simple_dtype` | ✓  | ✓    |        | ✓   |
+| `dequantize_int8_convrot_weight_dtype` | ✓ | ✓ |    | ✓   |
+| `int8_linear`               | ✓     | ✓    | ✓      | ✓   |
+| `gemv_awq_w4a16`            | ✓     | ✓    |        | ✓   |
+| `quantize_svdquant_w4a4`    | ✓     | ✓    |        | ✓   |
+| `scaled_mm_svdquant_w4a4`   | ✓     | ✓    |        | ✓   |
+| `convrot_w4a4_linear`       | ✓     | ✓    |        | ✓   |
+| `quantize_convrot_w4a4_weight` | ✓  | ✓    |        | ✓   |
+| `dequantize_convrot_w4a4_weight` | ✓ | ✓   |        | ✓   |
+
+Each of the eight rope entries also has an in-place form (`apply_rope_`,
+`rms_rope_split_half1_`, ...) with the same backend coverage as the row above.
+
+## HIP backend (AMD RDNA2 / RDNA3 / RDNA3.5 / RDNA4)
+
+The `hip` backend implements the quantized paths with its own kernels: WMMA
+matrix-core GEMMs on RDNA3/RDNA3.5/RDNA4, and non-WMMA kernels (quantizers,
+INT8 dequantizers, RoPE and the fused RMSNorm+RoPE, AdaLN and RMS-AdaLN, the AWQ
+GEMV) that also run on RDNA2. It does not link or call hipBLAS/hipBLASLt; every
+matmul is compiled from the sources in `comfy_kitchen/backends/hip/`.
+
+Both rope kernels address their inputs through the tensor's own strides, so a q/k
+pair permuted or sliced out of a packed qkv is read where it lies rather than
+copied contiguous first. The in-place entries (`apply_rope_`, `rms_rope_` and
+their split-half and single-tensor siblings) rotate a strided view in place for
+the same reason: each thread owns one element pair and loads both before storing
+either.
+
+`int8_linear(input_act=...)` folds the activation into the fused ConvRot
+quantizer's load, so an MLP's `linear(act(proj(x)))` never writes act's output to
+HBM just to read it straight back.
+
+What a GPU gets depends on whether it has matrix cores:
+
+| Generation | gfx targets                 | Matrix cores | What runs                               |
+|------------|-----------------------------|--------------|-----------------------------------------|
+| RDNA4      | `gfx1200`, `gfx1201`        | WMMA + fp8   | All HIP-supported kernels, fp8 native   |
+| RDNA3.5    | `gfx1150`-`gfx1153`         | WMMA, no fp8 | All HIP-supported kernels; fp8 widened  |
+| RDNA3      | `gfx1100`-`gfx1103`         | WMMA, no fp8 | All HIP-supported kernels; fp8 widened  |
+| RDNA2      | `gfx1030`-`gfx1036`         | none         | Non-WMMA kernels incl. AWQ GEMV; WMMA GEMMs decline |
+
+fp8, int8 and int4 share one byte-addressed tile kernel (`gemm_wmma.h`). RDNA3
+and RDNA4 spread a WMMA operand across the wave differently and RDNA3 has no fp8
+WMMA (it widens to bf16, which is exact), so each has its own set of `Mma`
+policies in `mma.h`; the tile kernel itself is shared.
+
+RDNA2 has no matrix cores. It runs the kernels that do not need them (RoPE,
+AdaLN and RMS-AdaLN, the quantizers, stochastic rounding, the AWQ GEMV) and does
+not advertise the GEMMs, which fall through to triton/eager. In a process with a
+mix of GPUs the capability set is the intersection, since kernels launch on the
+tensor's own device.
+
+A request outside a kernel's domain (swizzled operands, scaling other than
+tensor-wise, a K that is not a multiple of 16) falls back to torch or eager.
+NVFP4 and MXFP8 stay on eager everywhere: RDNA has neither fp4 WMMA nor
+microscaling hardware. Set `COMFY_KITCHEN_DISABLE_HIP=1` to remove the backend
+from dispatch.
+
+### Building
+
+On a ROCm-only host, the backend is selected automatically when CUDA's `nvcc`
+is absent. Both a system ROCm install and the pip `rocm-sdk` layout (which a
+ROCm PyTorch build already pulls in) are detected, so on Linux and Windows alike
+the usual build is:
+
+```bash
+pip install .
+```
+
+No environment variables, `CC`/`CXX` override or Visual Studio developer shell
+are needed: the ROCm clang builds C, C++ and HIP alike and locates the MSVC
+toolchain itself. CMake >= 3.26 and Ninja are required (Windows only ships a
+Visual Studio generator, which has no HIP language support). On Windows the
+Microsoft C++ build tools and Windows SDK must be installed, since clang links
+against them and CMake compiles a resource file with the SDK's `rc.exe`, which
+the build locates itself rather than expecting on `PATH`. Use the Visual Studio
+2022 v143 toolset; newer MSVC toolsets are not yet reliable with ROCm.
+
+When CUDA and ROCm toolchains are both installed, the source build defaults to
+CUDA only. This avoids compiling an unused multi-architecture HIP binary on an
+NVIDIA workstation. Request a combined build explicitly:
+
+```bash
+COMFY_KITCHEN_BUILD_HIP=1 pip install .
+```
+
+Architectures default to the validated GPUs the build machine can see, or to
+every target in the backend's architecture manifest when it can see none (a CI
+box), which is what the wheels carry. Detection reads the visible devices
+through PyTorch, so under PEP 517 build isolation (a plain `pip install .`) it
+sees nothing and falls back to the full target list; set `COMFY_HIP_ARCHS`, or
+pass `--no-build-isolation`, to build for the local GPU instead. Building for
+one target is much faster:
+
+```bash
+COMFY_HIP_ARCHS=gfx1201 pip install .
+```
+
+```powershell
+$env:COMFY_HIP_ARCHS = "gfx1201"; pip install .
+```
+
+`PYTORCH_ROCM_ARCH` and `GPU_ARCHS` are honoured too. When the build machine sees
+AMD GPUs but none is RDNA2/3/3.5/4 (CDNA has MFMA, not WMMA), the extension is
+skipped rather than built (seeing no GPU at all falls back to the full target list
+above instead);
+`COMFY_KITCHEN_BUILD_HIP=1` requests HIP explicitly (and makes an unsupported
+visible AMD GPU a hard error), while `COMFY_KITCHEN_BUILD_NO_HIP=1` suppresses
+the backend entirely.
+
+Architecture overrides are exact and fail closed. A compiler-recognized target
+that is not in the manifest is rejected until its device and WMMA policies have
+been reviewed and added.
+
+Both extensions are built against the Python limited API on 3.12+, so a wheel
+carrying CUDA and HIP side by side keeps its `abi3` tag. At runtime only the
+extension matching PyTorch's CUDA or ROCm runtime is loaded.
 
 
 ## Quantized Tensors
@@ -282,7 +413,10 @@ These options require using `setup.py` directly (not `pip install`):
 
 | Option | Command | Description | Default                                                                     |
 |--------|---------|-------------|-----------------------------------------------------------------------------|
-| `--no-cuda` | `python setup.py bdist_wheel --no-cuda` | Build CPU-only wheel (`py3-none-any`) | Enabled (build with CUDA)                                                   |
+| `--no-cuda` | `python setup.py bdist_wheel --no-cuda` | Disable CUDA; without `--hip`, build a CPU-only wheel | Enabled (build with CUDA)                                                   |
+| `--hip` | `python setup.py bdist_wheel --hip` | Add HIP explicitly (including to a CUDA build) | Auto only when CUDA is unavailable                                          |
+| `--no-hip` | `python setup.py bdist_wheel --no-hip` | Disable HIP | Disabled                                                                    |
+| `--hip-archs=...` | `python setup.py build_ext --hip-archs="gfx1200;gfx1201"` | HIP architectures to build for | Visible supported AMD GPUs, otherwise all supported targets                 |
 | `--cuda-archs=...` | `python setup.py build_ext --cuda-archs="80;89"` | CUDA architectures to build for | `75-virtual;80;89;90a;100f;120f` (Linux), `75-virtual;80;89;120f` (Windows) |
 | `--debug-build` | `python setup.py build_ext --debug-build` | Build in debug mode with symbols | Disabled (Release)                                                          |
 | `--lineinfo` | `python setup.py build_ext --lineinfo` | Enable NVCC line info for profiling | Disabled                                                                    |
@@ -308,7 +442,7 @@ python setup.py build_ext --debug-build --lineinfo bdist_wheel
   - Pre-built wheels require NVIDIA Driver r580+
   - Building from source requires CUDA Toolkit ≥12.8 and `CUDA_HOME` environment variable
 - **nanobind**: ≥2.0.0 (for building from source)
-- **CMake**: ≥3.18 (for building from source)
+- **CMake**: ≥3.26 (for building from source; the abi3 modules need FindPython's `Development.SABIModule`)
 
 ## Quick Start
 
@@ -316,7 +450,7 @@ python setup.py build_ext --debug-build --lineinfo bdist_wheel
 import comfy_kitchen as ck
 import torch
 
-# Automatic backend selection (triton -> cuda -> eager)
+# Automatic backend selection (hip -> cuda -> triton -> eager)
 x = torch.randn(100, 100, device="cuda")
 scale = torch.tensor([1.0], device="cuda")
 result = ck.quantize_per_tensor_fp8(x, scale)
@@ -337,11 +471,12 @@ with ck.use_backend("triton"):
 The library supports multiple backends:
 - **eager**: Pure PyTorch implementation
 - **cuda**: Custom CUDA C kernels (CUDA only)
+- **hip**: Custom HIP kernels (WMMA GEMMs on RDNA3/3.5/4; non-WMMA kernels also on RDNA2)
 - **triton**: Triton JIT-compiled kernels
 
 ### Automatic Backend Selection
 
-When you call a function, the registry selects the best backend by checking **constraints** in priority order (`cuda` → `triton` → `eager`):
+When you call a function, the registry selects the best backend by checking **constraints** in priority order (`hip` → `cuda` → `triton` → `eager`):
 
 ```python
 # Backend is selected automatically based on input constraints

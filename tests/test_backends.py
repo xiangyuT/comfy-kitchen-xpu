@@ -133,6 +133,11 @@ assert "{env_name}=1" not in reason, status
                 assert "scaled_mm_svdquant_w4a4" in xpu_caps
             if xpu._NORM_AVAILABLE:
                 assert "adaln" in xpu_caps
+                if hasattr(xpu._native_norm, "fused_rms_adaln"):
+                    assert "rms_adaln" in xpu_caps
+            if xpu._RMS_ROPE_AVAILABLE:
+                assert "rms_rope" in xpu_caps
+                assert "rms_rope_split_half_" in xpu_caps
             if xpu._GGUF_AVAILABLE:
                 assert "dequantize_gguf" in xpu_caps
 
