@@ -199,7 +199,10 @@ class BackendRegistry:
             NoCapableBackendError: If no backend can handle the call
         """
         failures: dict[str, str] = {}
-        validate = bool(kwargs)  # Skip validation if kwargs is empty/None
+        # Avoid Mapping truth-value conversion here. TorchDynamo represents the
+        # operator kwargs as a ConstDictVariable and cannot compile bool(kwargs)
+        # in fullgraph mode, while len() preserves the same empty/None contract.
+        validate = kwargs is not None and len(kwargs) != 0
 
         # Check for thread-local override first
         override = getattr(self._thread_local, "backend_override", None)
@@ -211,11 +214,21 @@ class BackendRegistry:
             elif validate:
                 result = self.validate_backend_for_call(override, func_name, kwargs)
                 if result.success:
-                    logger.debug("Backend %s selected for %s (override)", override, func_name)
+                    if not torch.compiler.is_compiling():
+                        logger.debug(
+                            "Backend %s selected for %s (override)",
+                            override,
+                            func_name,
+                        )
                     return override
                 failures[override] = f"{result.failed_param}: {result.failure_reason}"
             else:
-                logger.debug("Backend %s selected for %s (override)", override, func_name)
+                if not torch.compiler.is_compiling():
+                    logger.debug(
+                        "Backend %s selected for %s (override)",
+                        override,
+                        func_name,
+                    )
                 return override
 
         # Try backends in priority order
@@ -231,7 +244,8 @@ class BackendRegistry:
                     failures[backend_name] = f"{result.failed_param}: {result.failure_reason}"
                     continue
 
-            logger.debug("Backend %s selected for %s", backend_name, func_name)
+            if not torch.compiler.is_compiling():
+                logger.debug("Backend %s selected for %s", backend_name, func_name)
             return backend_name
 
         raise NoCapableBackendError(func_name, failures)
@@ -264,7 +278,7 @@ class BackendRegistry:
                 raise BackendNotFoundError(backend, "disabled")
             if func_name not in self._capabilities.get(backend, set()):
                 raise BackendNotImplementedError(backend, func_name)
-            if kwargs:
+            if kwargs is not None and len(kwargs) != 0:
                 result = self.validate_backend_for_call(backend, func_name, kwargs)
                 if not result.success:
                     raise NoCapableBackendError(func_name, {backend: f"{result.failed_param}: {result.failure_reason}"})

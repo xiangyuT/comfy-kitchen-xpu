@@ -178,10 +178,101 @@ if _AVAILABLE:
         quantize_int8_tensorwise = _int8.quantize_int8_tensorwise
         quantize_int8_rowwise = _int8.quantize_int8_rowwise
         dequantize_int8_simple = _int8.dequantize_int8_simple
-        int8_linear = _int8.int8_linear
         mm_int8 = _int8.mm_int8
         quantize_int8_convrot_weight = _int8.quantize_int8_convrot_weight
         dequantize_int8_convrot_weight = _int8.dequantize_int8_convrot_weight
+
+        _INT8_LINEAR_DTYPES = (
+            torch.float32,
+            torch.float16,
+            torch.bfloat16,
+        )
+        _INT8_LINEAR_INPUT_ACTS = (None, "none", "gelu_tanh", "swiglu")
+
+        @torch.library.custom_op(
+            "comfy_kitchen_xpu::int8_linear",
+            mutates_args=(),
+        )
+        def _compiled_int8_linear(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            weight_scale: torch.Tensor,
+            bias: torch.Tensor | None,
+            output_dtype_code: int,
+            convrot: bool,
+            convrot_groupsize: int,
+            input_act_code: int,
+        ) -> torch.Tensor:
+            return _int8.int8_linear(
+                x,
+                weight,
+                weight_scale,
+                bias,
+                _INT8_LINEAR_DTYPES[output_dtype_code],
+                convrot,
+                convrot_groupsize,
+                _INT8_LINEAR_INPUT_ACTS[input_act_code],
+            )
+
+        @_compiled_int8_linear.register_fake
+        def _compiled_int8_linear_fake(
+            x,
+            weight,
+            weight_scale,
+            bias,
+            output_dtype_code,
+            convrot,
+            convrot_groupsize,
+            input_act_code,
+        ):
+            del weight_scale, bias, convrot, convrot_groupsize, input_act_code
+            return x.new_empty(
+                (*x.shape[:-1], weight.shape[0]),
+                dtype=_INT8_LINEAR_DTYPES[output_dtype_code],
+            )
+
+        def int8_linear(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            weight_scale: torch.Tensor,
+            bias: torch.Tensor | None = None,
+            out_dtype: torch.dtype | None = None,
+            convrot: bool = False,
+            convrot_groupsize: int = 256,
+            input_act: str | None = None,
+        ) -> torch.Tensor:
+            if not torch.compiler.is_compiling():
+                return _int8.int8_linear(
+                    x,
+                    weight,
+                    weight_scale,
+                    bias,
+                    out_dtype,
+                    convrot,
+                    convrot_groupsize,
+                    input_act,
+                )
+
+            actual_dtype = x.dtype if out_dtype is None else out_dtype
+            output_dtype_code = {
+                torch.float32: 0,
+                torch.float16: 1,
+                torch.bfloat16: 2,
+            }.get(actual_dtype, 2)
+            try:
+                input_act_code = _INT8_LINEAR_INPUT_ACTS.index(input_act)
+            except ValueError as exc:
+                raise ValueError(f"Unsupported input_act: {input_act!r}") from exc
+            return _compiled_int8_linear(
+                x,
+                weight,
+                weight_scale,
+                bias,
+                output_dtype_code,
+                convrot,
+                convrot_groupsize,
+                input_act_code,
+            )
 
     if _NORM_AVAILABLE:
         from .adaln import adaln, rms_adaln
