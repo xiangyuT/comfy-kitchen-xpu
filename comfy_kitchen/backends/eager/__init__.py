@@ -1,5 +1,6 @@
 __all__ = [
     "adaln",
+    "na3d",
     "rms_adaln",
     "apply_rope",
     "apply_rope_",
@@ -27,6 +28,7 @@ __all__ = [
     "dequantize_int8_embedding",
     "dequantize_convrot_w4a4_weight",
     "dequantize_gguf",
+    "dequantize_w4a8_int8_weight",
     "gemv_awq_w4a16",
     "convrot_w4a4_linear",
     "prepare_int4_weight_for_int8_linear",
@@ -34,8 +36,10 @@ __all__ = [
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
     "quantize_convrot_w4a4_weight",
+    "quantize_w4a8_int8_weight",
     "quantize_int8_rowwise",
     "quantize_int8_convrot_weight",
+    "rotate_int8_convrot_weight",
     "quantize_and_rotate_rowwise",
     "quantize_int8_tensorwise",
     "quantize_svdquant_w4a4",
@@ -46,6 +50,7 @@ __all__ = [
     "stochastic_rounding_fp8",
     "int8_linear",
     "mm_int8",
+    "w4a8_int8_linear",
 ]
 
 import torch
@@ -54,6 +59,7 @@ from comfy_kitchen.constraints import (
     ExactDims,
     FunctionConstraints,
     ParamConstraint,
+    na3d_common_call_rule,
 )
 from comfy_kitchen.registry import registry
 
@@ -66,6 +72,7 @@ from .convrot_w4a4 import (
     quantize_convrot_w4a4_weight,
 )
 from .gguf import dequantize_gguf
+from .na import na3d
 from .quantization import (
     dequantize_int8_convrot_weight,
     dequantize_int8_convrot_weight_dtype,
@@ -84,6 +91,7 @@ from .quantization import (
     quantize_mxfp8,
     quantize_nvfp4,
     quantize_per_tensor_fp8,
+    rotate_int8_convrot_weight,
     scaled_mm_mxfp8,
     scaled_mm_nvfp4,
     stochastic_rounding_fp8,
@@ -108,6 +116,11 @@ from .rope import (
 )
 from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
 from .svdquant_w4a16 import svdquant_w4a16_linear
+from .w4a8_int8 import (
+    dequantize_w4a8_int8_weight,
+    quantize_w4a8_int8_weight,
+    w4a8_int8_linear,
+)
 
 
 def _build_constraints() -> dict:
@@ -183,15 +196,6 @@ def _build_constraints() -> dict:
                     dtypes=frozenset({torch.float8_e4m3fn}),
                 ),
                 "output_type": ParamConstraint(dtypes=standard_floats),
-            },
-            default_devices=all_devices,
-        ),
-        "dequantize_gguf": FunctionConstraints(
-            params={
-                "data": ParamConstraint(dtypes=frozenset({torch.uint8})),
-                "quant_type_code": ParamConstraint(dtypes=frozenset({int})),
-                "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
-                "layout_code": ParamConstraint(dtypes=frozenset({int})),
             },
             default_devices=all_devices,
         ),
@@ -344,42 +348,6 @@ def _build_constraints() -> dict:
             },
             default_devices=all_devices,
         ),
-        "svdquant_w4a16_linear": FunctionConstraints(
-            params={
-                "x": ParamConstraint(
-                    dtypes=frozenset({torch.float16, torch.bfloat16}),
-                    shape_rules=(ExactDims(2),),
-                ),
-                "packed_u4": ParamConstraint(
-                    dtypes=frozenset({torch.uint8}),
-                    shape_rules=(ExactDims(2),),
-                ),
-                "scales_f16": ParamConstraint(
-                    dtypes=frozenset({torch.float16}),
-                    shape_rules=(ExactDims(2),),
-                ),
-                "rcp_smooth_f16": ParamConstraint(
-                    dtypes=frozenset({torch.float16}),
-                    shape_rules=(ExactDims(1),),
-                ),
-                "lora_down": ParamConstraint(
-                    dtypes=frozenset({torch.float16, torch.bfloat16}),
-                    shape_rules=(ExactDims(2),),
-                ),
-                "lora_up": ParamConstraint(
-                    dtypes=frozenset({torch.float16, torch.bfloat16}),
-                    shape_rules=(ExactDims(2),),
-                ),
-                "bias": ParamConstraint(
-                    dtypes=frozenset({torch.float16, torch.bfloat16}),
-                    shape_rules=(ExactDims(1),),
-                ),
-                "output_dtype_code": ParamConstraint(
-                    dtypes=frozenset({int}),
-                ),
-            },
-            default_devices=all_devices,
-        ),
         "quantize_convrot_w4a4_weight": FunctionConstraints(
             params={
                 "weight": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
@@ -411,6 +379,45 @@ def _build_constraints() -> dict:
             },
             default_devices=all_devices,
         ),
+        "quantize_w4a8_int8_weight": FunctionConstraints(
+            params={
+                "weight": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "symmetric": ParamConstraint(dtypes=frozenset({bool})),
+                "scale_dtype": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn, torch.float32})),
+                "codebook": ParamConstraint(dtypes=frozenset({bool})),
+            },
+            default_devices=all_devices,
+        ),
+        "dequantize_w4a8_int8_weight": FunctionConstraints(
+            params={
+                "qdata": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
+                "s_rel": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn, torch.float32}), shape_rules=(ExactDims(2),)),
+                "s_channel": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)),
+                "codebook": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)),
+                "correction": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "output_dtype": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        "w4a8_int8_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "qdata": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
+                "s_rel": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn, torch.float32}), shape_rules=(ExactDims(2),)),
+                "s_channel": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)),
+                "codebook": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)),
+                "correction": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+                "bias": ParamConstraint(dtypes=standard_floats),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "out_dtype": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
         "prepare_int4_weight_for_int8_linear": FunctionConstraints(
             params={
                 "weight": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
@@ -430,6 +437,64 @@ def _build_constraints() -> dict:
             default_devices=all_devices,
         ),
     }
+
+    # Fork extensions retained across the upstream 0.2.28 synchronization.
+    out["dequantize_gguf"] = FunctionConstraints(
+        params={
+            "data": ParamConstraint(dtypes=frozenset({torch.uint8})),
+            "quant_type_code": ParamConstraint(dtypes=frozenset({int})),
+            "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
+            "layout_code": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["svdquant_w4a16_linear"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(
+                dtypes=frozenset({torch.float16, torch.bfloat16}),
+                shape_rules=(ExactDims(2),),
+            ),
+            "packed_u4": ParamConstraint(
+                dtypes=frozenset({torch.uint8}),
+                shape_rules=(ExactDims(2),),
+            ),
+            "scales_f16": ParamConstraint(
+                dtypes=frozenset({torch.float16}),
+                shape_rules=(ExactDims(2),),
+            ),
+            "rcp_smooth_f16": ParamConstraint(
+                dtypes=frozenset({torch.float16}),
+                shape_rules=(ExactDims(1),),
+            ),
+            "lora_down": ParamConstraint(
+                dtypes=frozenset({torch.float16, torch.bfloat16}),
+                shape_rules=(ExactDims(2),),
+            ),
+            "lora_up": ParamConstraint(
+                dtypes=frozenset({torch.float16, torch.bfloat16}),
+                shape_rules=(ExactDims(2),),
+            ),
+            "bias": ParamConstraint(
+                dtypes=frozenset({torch.float16, torch.bfloat16}),
+                shape_rules=(ExactDims(1),),
+            ),
+            "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["mm_int8"] = FunctionConstraints(
+        params={
+            "a": ParamConstraint(
+                dtypes=frozenset({torch.int8}),
+                shape_rules=(ExactDims(2),),
+            ),
+            "b": ParamConstraint(
+                dtypes=frozenset({torch.int8}),
+                shape_rules=(ExactDims(2),),
+            ),
+        },
+        default_devices=all_devices,
+    )
 
     out["quantize_int8_tensorwise"] = FunctionConstraints(
         params={
@@ -460,6 +525,13 @@ def _build_constraints() -> dict:
             "weight": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
             "group_size": ParamConstraint(dtypes=frozenset({int})),
             "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["rotate_int8_convrot_weight"] = FunctionConstraints(
+        params={
+            "weight": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+            "group_size": ParamConstraint(dtypes=frozenset({int})),
         },
         default_devices=all_devices,
     )
@@ -513,13 +585,6 @@ def _build_constraints() -> dict:
             "bias": ParamConstraint(dtypes=standard_floats),
             "convrot": ParamConstraint(dtypes=frozenset({bool})),
             "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
-        },
-        default_devices=all_devices,
-    )
-    out["mm_int8"] = FunctionConstraints(
-        params={
-            "a": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
-            "b": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
         },
         default_devices=all_devices,
     )
@@ -578,6 +643,15 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         out[inplace_name] = out[functional_name]
+    out["na3d"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
+            "k": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
+            "v": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
+        },
+        default_devices=all_devices,
+        call_rules=(na3d_common_call_rule,),
+    )
     return out
 
 

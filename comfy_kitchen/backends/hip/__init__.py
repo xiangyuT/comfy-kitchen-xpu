@@ -24,11 +24,17 @@ from collections.abc import Sequence
 
 import torch
 
-from comfy_kitchen._rope_utils import check_rope_inplace
+from comfy_kitchen._rope_utils import check_rope_inplace, trim_rope_freqs
 from comfy_kitchen.backends import eager as _eager
 from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
 from comfy_kitchen.backends._activations import input_act_code as _input_act_code
+from comfy_kitchen.backends._activations import input_act_width as _input_act_width
+from comfy_kitchen.backends.eager import rope as _eager_rope
 from comfy_kitchen.backends.eager.quantization import DTYPE_CODE_TO_DTYPE, DTYPE_TO_CODE
+from comfy_kitchen.backends.eager.w4a8_int8 import (
+    _dequantize_w4a8_int8_weight_from_int8,
+    validate_w4a8_operands,
+)
 
 logger = logging.getLogger("comfy_kitchen.hip")
 
@@ -51,6 +57,7 @@ __all__ = [
     "dequantize_int8_convrot_weight_dtype",
     "dequantize_int8_simple_dtype",
     "dequantize_per_tensor_fp8",
+    "dequantize_w4a8_int8_weight",
     "has_wmma",
     "int8_linear",
     "is_available",
@@ -70,6 +77,7 @@ __all__ = [
     "rms_rope_split_half1_",
     "scaled_mm_fp8",
     "stochastic_rounding_fp8",
+    "w4a8_int8_linear",
 ]
 
 _C = None
@@ -150,6 +158,7 @@ _WMMA_ONLY_OPS = frozenset({
     "int8_linear",
     "convrot_w4a4_linear",
     "scaled_mm_svdquant_w4a4",
+    "w4a8_int8_linear",
 })
 
 
@@ -522,7 +531,9 @@ def _convrot_supported(
 def _rotate_quant_int8(
     x2d: torch.Tensor, group_size: int, input_act: str | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    m, k = x2d.shape
+    m, k_in = x2d.shape
+    # swiglu halves the row: the [gate | up] input is twice the quantized width.
+    k = k_in // _input_act_width(input_act)
     q = torch.empty((m, k), dtype=torch.int8, device=x2d.device)
     scales = torch.empty((m,), dtype=torch.float32, device=x2d.device)
     # check_convrot_k queries the current device's LDS budget, so pin it to the
@@ -593,14 +604,11 @@ def int8_linear(
     """INT8 linear with dynamic row-wise activation quantization, on WMMA."""
     # Rejected here so every route fails the same way, not just the fused one.
     _input_act_code(input_act)
-    if input_act == "swiglu":
-        # The WMMA quantizer does not fuse the gated pair; apply it eagerly so
-        # the row width and result match the fused backends.
-        x = _apply_input_act(x, input_act)
-        input_act = None
-    if x.shape[-1] != weight.shape[-1]:
+    # k_act is the activated (quantized) row width: swiglu halves the raw row.
+    k_act = x.shape[-1] // _input_act_width(input_act)
+    if k_act != weight.shape[-1]:
         raise ValueError(
-            f"Input and weight inner dimensions must match, got {x.shape[-1]} and {weight.shape[-1]}"
+            f"Input and weight inner dimensions must match, got {k_act} and {weight.shape[-1]}"
         )
 
     weight = _aligned(weight.to(device=x.device).contiguous())
@@ -612,7 +620,8 @@ def int8_linear(
 
     orig_shape = x.shape
     x2d = x.reshape(-1, orig_shape[-1]).contiguous()
-    m, k = x2d.shape
+    m = x2d.shape[0]
+    k = k_act
     n = weight.shape[0]
 
     # The WMMA K-step and the small-M GEMV both read a row 16 bytes at a time.
@@ -651,6 +660,239 @@ def int8_linear(
         m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
     )
     return out.reshape(*orig_shape[:-1], n)
+
+
+# ---------------------------------------------------------------------------
+# Grouped W4A8 over the INT8 GEMM
+# ---------------------------------------------------------------------------
+
+def _dequant_int4_grouped_to_int8(
+    qdata: torch.Tensor,
+    s_rel: torch.Tensor,
+    codebook: torch.Tensor | None,
+    group_size: int,
+) -> torch.Tensor:
+    """Decode packed INT4 weights to the grouped INT8 grid the GEMM consumes."""
+    n, k_half = qdata.shape
+    k = k_half * 2
+    device = qdata.device
+    qdata_arg = _operand(qdata, device, "qdata")
+    scale_code = DTYPE_TO_CODE[s_rel.dtype]
+    # fp8 crosses the binding as raw bytes, as it does everywhere else here.
+    s_rel_arg = _operand(s_rel, device, "s_rel")
+    if s_rel.dtype == torch.float8_e4m3fn:
+        s_rel_arg = s_rel_arg.view(torch.uint8)
+    codebook_arg = (
+        None
+        if codebook is None
+        else codebook.to(device=device, dtype=torch.float32).reshape(-1).contiguous()
+    )
+
+    out = torch.empty((n, k), dtype=torch.int8, device=device)
+    _C.dequant_int4_grouped_to_int8(
+        _dl(qdata_arg),
+        _dl(s_rel_arg),
+        scale_code,
+        None if codebook_arg is None else _dl(codebook_arg),
+        _dl(out),
+        n,
+        k,
+        group_size,
+        _stream(qdata),
+    )
+    return out
+
+
+def _tuning_env_int(name: str, default: int) -> int:
+    """A non-negative tuning knob from the environment, or ``default``.
+
+    These are read at import, and the backend is imported unguarded, so letting a
+    typo raise would take out ``import comfy_kitchen`` itself rather than just the
+    knob. A tuning value is never worth that.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("ignoring non-integer %s=%r, using %d", name, raw, default)
+        return default
+
+
+# A chunk is worth decoding separately only while it is still cached when the GEMM
+# reads it back, so the target is the device's own L2 rather than a tuned constant.
+# The cap matches the CUDA backend's chunk width, keeping a shallow K from making a
+# chunk pointlessly wide; the floor keeps a deep K from starving the GEMM's N grid,
+# which costs far more than the decode saves.
+_W4A8_MAX_CHUNK_COLS = _tuning_env_int("COMFY_KITCHEN_W4A8_CHUNK_COLS", 4096)
+_W4A8_MIN_CHUNK_COLS = 1024
+# Chunking pays while the decode, not the GEMM, sets the cost. Where that crossover
+# sits depends on the part, so the limit is the conservative end of what measured as
+# a win on every shape tried: above it the weight is decoded in one pass, which is
+# what this path did before chunking, so a part that crosses over later loses only
+# the extra win rather than regressing.
+_W4A8_CHUNK_MAX_ROWS = _tuning_env_int("COMFY_KITCHEN_W4A8_CHUNK_MAX_ROWS", 64)
+_W4A8_FALLBACK_L2_BYTES = 4 << 20
+_w4a8_l2_bytes: dict[int, int] = {}
+
+
+def _w4a8_chunk_cols(m: int, n: int, k: int, device: torch.device) -> int:
+    """How many weight columns to decode before running the GEMM on them.
+
+    ``n`` decodes the weight in one pass, which is what the chunked launcher does
+    with a single chunk.
+    """
+    if m > _W4A8_CHUNK_MAX_ROWS or not _W4A8_MAX_CHUNK_COLS:
+        return n
+
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    budget = _w4a8_l2_bytes.get(index)
+    if budget is None:
+        props = torch.cuda.get_device_properties(index)
+        budget = getattr(props, "L2_cache_size", 0) or _W4A8_FALLBACK_L2_BYTES
+        _w4a8_l2_bytes[index] = budget
+
+    # Rounded to the widest N tile, so a chunk boundary never splits one.
+    cols = min(_W4A8_MAX_CHUNK_COLS, max(_W4A8_MIN_CHUNK_COLS, budget // max(k, 1) // 128 * 128))
+    return min(n, cols)
+
+
+def _w4a8_int8_linear_chunked(
+    x: torch.Tensor,
+    qdata: torch.Tensor,
+    s_rel: torch.Tensor,
+    s_channel: torch.Tensor,
+    codebook: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    group_size: int,
+    convrot_groupsize: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    n, k_half = qdata.shape
+    k = k_half * 2
+    device = x.device
+    orig_shape = x.shape
+    x2d = x.reshape(-1, k).contiguous()
+    m = x2d.shape[0]
+
+    # Rotated and quantized once: the chunk loop only walks the weight.
+    xq, xs = _rotate_quant_int8(x2d, convrot_groupsize)
+
+    scale_code = DTYPE_TO_CODE[s_rel.dtype]
+    s_rel_arg = _operand(s_rel, device, "s_rel")
+    if s_rel.dtype == torch.float8_e4m3fn:
+        s_rel_arg = s_rel_arg.view(torch.uint8)
+    codebook_arg = (
+        None
+        if codebook is None
+        else codebook.to(device=device, dtype=torch.float32).reshape(-1).contiguous()
+    )
+    s_channel_arg = s_channel.to(device=device, dtype=torch.float32).reshape(-1).contiguous()
+    bias_arg = None if bias is None else _bias_operand(bias, n, device)
+
+    qdata_arg = _operand(qdata, device, "qdata")
+    xs_arg = xs.reshape(-1).contiguous()
+    # An empty weight has no chunk to size; the loop then has nothing to walk.
+    chunk_cols = max(1, _w4a8_chunk_cols(m, n, k, device))
+    workspace = torch.empty((chunk_cols, k), dtype=torch.int8, device=device)
+    out = torch.empty((m, n), dtype=out_dtype, device=device)
+    _C.w4a8_int8_gemm_chunked(
+        _dl(xq),
+        _dl(qdata_arg),
+        _dl(s_rel_arg),
+        scale_code,
+        None if codebook_arg is None else _dl(codebook_arg),
+        _dl(s_channel_arg),
+        _dl(xs_arg),
+        None if bias_arg is None else _dl(bias_arg),
+        _dl(workspace),
+        _dl(out),
+        m,
+        n,
+        k,
+        group_size,
+        chunk_cols,
+        DTYPE_TO_CODE[out_dtype],
+        _stream(x),
+    )
+    return out.reshape(*orig_shape[:-1], n)
+
+
+def dequantize_w4a8_int8_weight(
+    qdata: torch.Tensor,
+    s_rel: torch.Tensor,
+    s_channel: torch.Tensor,
+    codebook: torch.Tensor | None = None,
+    correction: torch.Tensor | None = None,
+    group_size: int = 16,
+    convrot_groupsize: int = 256,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Decode W4A8 storage into its physical [N, K] floating weight."""
+    validate_w4a8_operands(
+        qdata, s_rel, s_channel, codebook, correction, group_size, convrot_groupsize
+    )
+    int8_weight = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
+    weight_rotated = _dequantize_w4a8_int8_weight_from_int8(
+        int8_weight, s_channel, correction, group_size, output_dtype
+    )
+    # Rotating back has no HIP kernel. Eager applies the same orthonormal ConvRot
+    # transform the fused activation path uses, and it is its own inverse.
+    return _eager.rotate_int8_convrot_weight(weight_rotated, convrot_groupsize).to(output_dtype)
+
+
+def w4a8_int8_linear(
+    x: torch.Tensor,
+    qdata: torch.Tensor,
+    s_rel: torch.Tensor,
+    s_channel: torch.Tensor,
+    codebook: torch.Tensor | None = None,
+    correction: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    group_size: int = 16,
+    convrot_groupsize: int = 256,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """``x @ W.T + bias`` via the HIP INT4 decode feeding the WMMA INT8 GEMM.
+
+    The weight is decoded a column chunk at a time so a chunk is still cached when
+    the GEMM reads it back, instead of the whole [N, K] INT8 weight round-tripping
+    through global memory.
+    """
+    validate_w4a8_operands(
+        qdata, s_rel, s_channel, codebook, correction, group_size, convrot_groupsize
+    )
+    if x.shape[-1] != qdata.shape[-1] * 2:
+        raise ValueError(f"Input K={x.shape[-1]} does not match qdata K={qdata.shape[-1] * 2}")
+
+    # The asymmetric zero-point correction is a rank-one term the INT8 epilogue
+    # cannot express, so that layout runs off the dequantized weight instead.
+    if correction is not None:
+        weight = dequantize_w4a8_int8_weight(
+            qdata,
+            s_rel,
+            s_channel,
+            codebook=codebook,
+            correction=correction,
+            group_size=group_size,
+            convrot_groupsize=convrot_groupsize,
+            output_dtype=x.dtype,
+        )
+        return torch.nn.functional.linear(x, weight, bias).to(out_dtype)
+
+    # The layout allows any ConvRot group that divides K; the fused activation
+    # quantizer takes only the three it has butterfly stages for, and its LDS
+    # budget bounds K. int8_linear applies the same test before its own fast path.
+    if not _convrot_supported(x.shape[-1], convrot_groupsize, x.device, x.dtype):
+        int8_weight = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
+        return _eager.int8_linear(
+            x, int8_weight, s_channel, bias, out_dtype, True, convrot_groupsize
+        )
+
+    return _w4a8_int8_linear_chunked(
+        x, qdata, s_rel, s_channel, codebook, bias, group_size, convrot_groupsize, out_dtype
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1019,6 +1261,9 @@ def _rope(xq, xk, freqs_cis, split_half, inplace=False):
         xq_out = torch.empty(xq.shape, dtype=xq.dtype, device=xq.device)
         xk_out = None if xk is None else torch.empty(xk.shape, dtype=xk.dtype, device=xk.device)
 
+    if not split_half:
+        freqs_cis = trim_rope_freqs(xq, freqs_cis)
+
     _C.apply_rope(
         _dl(xq), None if xk is None else _dl(xk), _dl(freqs_cis),
         _dl(xq_out), None if xk_out is None else _dl(xk_out),
@@ -1097,7 +1342,7 @@ def _rms_rope_weight(scale: torch.Tensor, head_dim: int) -> torch.Tensor | None:
     return scale.contiguous()
 
 
-def _rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace=False):
+def _rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace=False, rot_dim=0):
     if k is not None and k_scale is None:
         k_scale = q_scale
     # One dtype code and one stream are passed for the whole launch, so every
@@ -1116,11 +1361,19 @@ def _rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace=Fa
         # No fused path; eager returns fresh tensors, so in place they are
         # written back through the views.
         if k is None:
-            impl = _eager.rms_rope_split_half1 if split_half else _eager.rms_rope1
-            out = impl(q, freqs_cis, q_scale, epsilon)
+            if rot_dim:
+                # Only the private eager helper takes rot_dim for a single tensor.
+                out = _eager_rope._rms_rope1(
+                    q, freqs_cis, q_scale, epsilon, split_half=split_half, rot_dim=rot_dim)
+            else:
+                impl = _eager.rms_rope_split_half1 if split_half else _eager.rms_rope1
+                out = impl(q, freqs_cis, q_scale, epsilon)
             return (q.copy_(out) if inplace else out), None
+        # Only the split-half pair takes rot_dim upstream; rot_dim never reaches
+        # the interleaved path, which has no public rot_dim argument.
         impl = _eager.rms_rope_split_half if split_half else _eager.rms_rope
-        q_out, k_out = impl(q, k, freqs_cis, q_scale, k_scale, epsilon)
+        kwargs = {"rot_dim": rot_dim} if rot_dim and split_half else {}
+        q_out, k_out = impl(q, k, freqs_cis, q_scale, k_scale, epsilon, **kwargs)
         if inplace:
             return q.copy_(q_out), k.copy_(k_out)
         return q_out, k_out
@@ -1139,12 +1392,13 @@ def _rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace=Fa
         _dl(q), None if k is None else _dl(k), _dl(freqs_cis),
         _dl(q_weight), None if k_weight is None else _dl(k_weight),
         _dl(q_out), None if k_out is None else _dl(k_out),
-        epsilon, split_half, _stream(q),
+        epsilon, split_half, _stream(q), rot_dim,
     )
     return q_out, k_out
 
 
-def _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace=False):
+def _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace=False,
+                   rot_dim=0):
     if k_scale is None:
         k_scale = q_scale
     # One dtype code covers both inputs and one more both weights, so a difference
@@ -1156,10 +1410,12 @@ def _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inpla
         or (inplace and _effective_strides(q) != _effective_strides(k))
     ):
         return (
-            _rms_rope(q, None, freqs_cis, q_scale, None, epsilon, split_half, inplace)[0],
-            _rms_rope(k, None, freqs_cis, k_scale, None, epsilon, split_half, inplace)[0],
+            _rms_rope(q, None, freqs_cis, q_scale, None, epsilon, split_half, inplace,
+                      rot_dim)[0],
+            _rms_rope(k, None, freqs_cis, k_scale, None, epsilon, split_half, inplace,
+                      rot_dim)[0],
         )
-    return _rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace)
+    return _rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace, rot_dim)
 
 
 def rms_rope1(
@@ -1234,11 +1490,7 @@ def rms_rope_split_half(
     epsilon: float = 1e-6,
     rot_dim: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if rot_dim and rot_dim != q.shape[-1]:
-        # partial rotary is not fused in the WMMA kernel
-        return _eager.rms_rope_split_half(
-            q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim=rot_dim)
-    return _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, True)
+    return _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, True, rot_dim=rot_dim)
 
 
 def rms_rope_split_half_(
@@ -1252,12 +1504,9 @@ def rms_rope_split_half_(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if k_scale is None:
         k_scale = q_scale
-    if rot_dim and rot_dim != q.shape[-1]:
-        # partial rotary is not fused in the WMMA kernel
-        return _eager.rms_rope_split_half_(
-            q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim=rot_dim)
     check_rope_inplace(q, k, readonly=(freqs_cis, q_scale, k_scale))
-    return _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, True, inplace=True)
+    return _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, True, inplace=True,
+                          rot_dim=rot_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -1343,6 +1592,54 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             params={
                 "x": ParamConstraint(dtypes=floats, shape_rules=(DivisibleBy(-1, 16),)),
                 "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
+                "out_dtype": ParamConstraint(dtypes=out_floats),
+            },
+            default_devices=dev,
+        ),
+        "dequantize_w4a8_int8_weight": FunctionConstraints(
+            params={
+                "qdata": ParamConstraint(
+                    dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)
+                ),
+                "s_rel": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn, torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "s_channel": ParamConstraint(
+                    dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)
+                ),
+                "codebook": ParamConstraint(
+                    dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)
+                ),
+                "correction": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "output_dtype": ParamConstraint(dtypes=out_floats),
+            },
+            default_devices=dev,
+        ),
+        # K must be a multiple of 16 for the same reason as int8_linear, and so
+        # that the INT4 decode's 16-column store stays inside its own row.
+        "w4a8_int8_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=floats, shape_rules=(DivisibleBy(-1, 16),)),
+                "qdata": ParamConstraint(
+                    dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)
+                ),
+                "s_rel": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn, torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "s_channel": ParamConstraint(
+                    dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)
+                ),
+                "codebook": ParamConstraint(
+                    dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)
+                ),
+                "correction": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
+                "bias": ParamConstraint(dtypes=floats),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
                 "out_dtype": ParamConstraint(dtypes=out_floats),
             },
             default_devices=dev,

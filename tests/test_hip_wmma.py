@@ -8,11 +8,13 @@ import pytest
 import torch
 
 import comfy_kitchen as ck
+from comfy_kitchen.backends.eager import w4a8_int8 as eager_w4a8
 from comfy_kitchen.backends.eager.convrot_w4a4 import _unpack_int4_row_major
 from comfy_kitchen.backends.eager.quantization import (
     quantize_and_rotate_rowwise as eager_quantize_and_rotate_rowwise,
 )
 from comfy_kitchen.registry import registry
+from comfy_kitchen.tensor import AsymW4A8Int8Layout, QuantizedTensor
 from comfy_kitchen.tensor.int8_utils import _build_hadamard
 
 
@@ -228,6 +230,70 @@ def test_int8_linear_input_act_matches_the_eager_chain(tag, shape, kwargs):
     assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale, tag
 
 
+def _swiglu(x):
+    gate, up = x.chunk(2, dim=-1)
+    return torch.nn.functional.silu(gate) * up
+
+
+# swiglu is the gated pair: the input row is [gate | up] and the quantized row is
+# half as wide, so the shapes below give the raw (2 * K) width.
+@needs_wmma
+@pytest.mark.parametrize(
+    ("tag", "shape", "kwargs"),
+    [
+        ("fused convrot", (256, 2 * 1024), {"convrot": True, "convrot_groupsize": 256}),
+        ("no convrot", (256, 2 * 1024), {"convrot": False}),
+        ("m == 1", (1, 2 * 1024), {"convrot": True, "convrot_groupsize": 256}),
+    ],
+)
+def test_int8_linear_swiglu_matches_the_eager_chain(tag, shape, kwargs):
+    """int8_linear(x, input_act="swiglu") == int8_linear(swiglu(x)) on every route."""
+    torch.manual_seed(0)
+    m, k2 = shape
+    k = k2 // 2
+    n = 256
+    x = torch.randn(m, k2, device=DEV, dtype=torch.bfloat16)
+    w = torch.randn(n, k, device=DEV, dtype=torch.bfloat16)
+    wq, ws = ck.quantize_int8_rowwise(w)
+    ws = ws.reshape(-1)
+
+    with ck.use_backend("hip"):
+        ref = ck.int8_linear(_swiglu(x), wq, ws, None, torch.bfloat16, **kwargs)
+        out = ck.int8_linear(x, wq, ws, None, torch.bfloat16,
+                             input_act="swiglu", **kwargs)
+
+    assert out.shape == (m, n), tag
+    scale = ref.float().abs().max().item()
+    assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale, tag
+
+
+@needs_wmma
+def test_swiglu_quantizer_is_at_least_as_accurate_as_the_chain(hip):
+    """Fusing the gate into the rotation's load must not lose accuracy against
+    materializing silu(gate) * up in bf16 first."""
+    torch.manual_seed(0)
+    m, k, group = 512, 1024, 256
+    x = torch.randn(m, 2 * k, device=DEV, dtype=torch.bfloat16) * 2.0
+
+    xd = x.double()
+    activated = torch.nn.functional.silu(xd[:, :k]) * xd[:, k:]
+    mat = _build_hadamard(group, device=x.device, dtype=torch.float64)
+    rotated = (activated.reshape(-1, k // group, group) @ mat).reshape(-1, k)
+    scale = (rotated.abs().amax(-1, keepdim=True) / 127.0).clamp(min=1e-30)
+    exact = (rotated / scale).round().clamp(-128, 127)
+
+    chain_q, _ = hip._rotate_quant_int8(_swiglu(x).contiguous(), group)
+    fused_q, fused_s = hip._rotate_quant_int8(x, group, "swiglu")
+
+    err_chain = (chain_q.double() - exact).abs().mean().item()
+    err_fused = (fused_q.double() - exact).abs().mean().item()
+    assert err_fused <= max(err_chain * 1.05, 1e-4), (
+        f"fused ({err_fused:.6f}) less accurate than chain ({err_chain:.6f})"
+    )
+    assert fused_q.shape == (m, k)
+    assert fused_s.shape == (m,)
+
+
 @needs_wmma
 def test_int8_linear_input_act_none_is_the_identity():
     """None and "none" must be bit-identical to omitting the argument."""
@@ -383,6 +449,225 @@ def test_convrot_w4a4_roundtrip(hip):
     assert deq.shape == w.shape
     rel = (deq - w.float()).norm() / w.float().norm()
     assert rel < 0.2  # int4 weight fidelity
+
+
+# ---------------------------------------------------------------------------
+# Grouped W4A8 over the INT8 GEMM
+# ---------------------------------------------------------------------------
+
+def _quantize_w4a8(n, k, **kwargs):
+    w = torch.randn(n, k, device=DEV, dtype=torch.bfloat16) * 0.02
+    return w, eager_w4a8.quantize_w4a8_int8_weight(w, **kwargs)
+
+
+@pytest.mark.parametrize("group_size", [4, 8, 16, 32, 64])
+@pytest.mark.parametrize("scale_dtype", [torch.float8_e4m3fn, torch.float32])
+@pytest.mark.parametrize("codebook", [False, True])
+def test_w4a8_int4_decode_is_bit_exact(hip, group_size, scale_dtype, codebook):
+    """The decode rounds one value at a time, so it must agree with eager exactly."""
+    torch.manual_seed(0)
+    _, (qdata, s_rel, _, _, cb) = _quantize_w4a8(
+        128, 512, group_size=group_size, scale_dtype=scale_dtype, codebook=codebook
+    )
+
+    out = hip._dequant_int4_grouped_to_int8(qdata, s_rel, cb, group_size)
+    ref = eager_w4a8._dequant_int4_grouped_to_int8(qdata, s_rel, cb, group_size)
+
+    assert out.shape == ref.shape and out.dtype == torch.int8
+    assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("symmetric", [True, False])
+def test_w4a8_dequantize_weight_matches_eager(hip, symmetric):
+    torch.manual_seed(0)
+    w, (qdata, s_rel, s_channel, correction, cb) = _quantize_w4a8(
+        128, 512, symmetric=symmetric, codebook=symmetric
+    )
+    kwargs = {"codebook": cb, "correction": correction, "output_dtype": torch.bfloat16}
+
+    out = hip.dequantize_w4a8_int8_weight(qdata, s_rel, s_channel, **kwargs)
+    ref = eager_w4a8.dequantize_w4a8_int8_weight(qdata, s_rel, s_channel, **kwargs)
+
+    torch.testing.assert_close(out.float(), ref.float(), rtol=0, atol=0)
+    rel = (out.float() - w.float()).norm() / w.float().norm()
+    assert rel < 0.2  # int4 weight fidelity
+
+
+@pytest.mark.parametrize(("m", "n", "k"), [(1, 256, 512), (17, 512, 256), (256, 1024, 512)])
+@pytest.mark.parametrize("bias", [False, True])
+@needs_wmma
+def test_w4a8_linear_matches_eager(hip, m, n, k, bias):
+    torch.manual_seed(0)
+    _, (qdata, s_rel, s_channel, correction, cb) = _quantize_w4a8(n, k)
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    bias_t = torch.randn(n, device=DEV, dtype=torch.bfloat16) if bias else None
+    kwargs = {
+        "codebook": cb,
+        "correction": correction,
+        "bias": bias_t,
+        "out_dtype": torch.bfloat16,
+    }
+
+    out = hip.w4a8_int8_linear(x, qdata, s_rel, s_channel, **kwargs)
+    ref = eager_w4a8.w4a8_int8_linear(x, qdata, s_rel, s_channel, **kwargs)
+
+    assert out.shape == (m, n)
+    # Both decode the weight identically and differ only in how the activation
+    # quantizer rounds, so compare with an int8-sized tolerance.
+    scale = ref.float().abs().max().item()
+    assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale
+
+
+@pytest.mark.parametrize(("n", "chunk_cols"), [(1024, 256), (1280, 512), (1152, 384)])
+@pytest.mark.parametrize("m", [4, 192], ids=["gemv", "wmma"])
+@needs_wmma
+def test_w4a8_linear_chunking_does_not_change_the_result(hip, monkeypatch, n, chunk_cols, m):
+    """Each chunk writes an N-column slice of the output through ldc, so a chunk
+    boundary (including a short trailing one) must not disturb its neighbours."""
+    torch.manual_seed(0)
+    k = 512
+    _, (qdata, s_rel, s_channel, _, cb) = _quantize_w4a8(n, k)
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    bias = torch.randn(n, device=DEV, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(hip, "_w4a8_chunk_cols", lambda *_: n)
+    one_pass = hip.w4a8_int8_linear(x, qdata, s_rel, s_channel, codebook=cb, bias=bias)
+    monkeypatch.setattr(hip, "_w4a8_chunk_cols", lambda *_: chunk_cols)
+    chunked = hip.w4a8_int8_linear(x, qdata, s_rel, s_channel, codebook=cb, bias=bias)
+
+    assert chunked.shape == (m, n)
+    assert torch.equal(chunked, one_pass)
+
+
+def test_w4a8_chunk_cols_stays_within_its_bounds(hip):
+    n, k, dev = 12288, 3072, torch.device(DEV, torch.cuda.current_device())
+    cols = hip._w4a8_chunk_cols(1, n, k, dev)
+    assert cols < n
+    assert cols % 128 == 0
+    assert hip._W4A8_MIN_CHUNK_COLS <= cols <= hip._W4A8_MAX_CHUNK_COLS
+    # Enough rows that the GEMM, not the decode, sets the cost.
+    assert hip._w4a8_chunk_cols(hip._W4A8_CHUNK_MAX_ROWS + 1, n, k, dev) == n
+    # A weight no wider than one chunk is decoded in one pass either way.
+    assert hip._w4a8_chunk_cols(1, cols // 2, k, dev) == cols // 2
+    # A deep K keeps the floor rather than shrinking the GEMM's N grid, and a
+    # shallow one keeps the cap rather than widening a chunk pointlessly.
+    assert hip._w4a8_chunk_cols(1, n, 1 << 20, dev) == hip._W4A8_MIN_CHUNK_COLS
+    assert hip._w4a8_chunk_cols(1, 1 << 20, 16, dev) == hip._W4A8_MAX_CHUNK_COLS
+
+
+@pytest.mark.parametrize("m", [4, 192], ids=["gemv", "wmma"])
+@needs_wmma
+def test_w4a8_realigns_an_offset_qdata(hip, m):
+    """The decode reads packed weights as uint2, so qdata has to start aligned;
+    contiguous() is a no-op on a slice that does not."""
+    torch.manual_seed(0)
+    n, k = 256, 512
+    _, (qdata, s_rel, s_channel, _, cb) = _quantize_w4a8(n, k)
+    offset = _offset_copy(qdata)
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+
+    assert torch.equal(
+        hip._dequant_int4_grouped_to_int8(offset, s_rel, cb, 16),
+        hip._dequant_int4_grouped_to_int8(qdata, s_rel, cb, 16),
+    )
+    assert torch.equal(
+        hip.w4a8_int8_linear(x, offset, s_rel, s_channel, codebook=cb),
+        hip.w4a8_int8_linear(x, qdata, s_rel, s_channel, codebook=cb),
+    )
+
+
+@needs_wmma
+def test_w4a8_consumes_a_row_chunked_quantize(hip):
+    """The shared packer rotates and packs in row chunks and pins one codebook across
+    them. HIP owns no part of that, so what it must keep proving is that it decodes
+    whatever comes out, including a table reused across a requantize."""
+    torch.manual_seed(0)
+    k = 2048
+    n = eager_w4a8._QUANT_ROW_ELEM_BUDGET // k + 512  # over the packer's row budget
+    w = torch.randn(n, k, device=DEV, dtype=torch.bfloat16) * 0.02
+    qdata, s_rel, _, _, cb = eager_w4a8.quantize_w4a8_int8_weight(w)
+    assert cb is not None
+
+    assert torch.equal(
+        hip._dequant_int4_grouped_to_int8(qdata, s_rel, cb, 16),
+        eager_w4a8._dequant_int4_grouped_to_int8(qdata, s_rel, cb, 16),
+    )
+
+    # A LoRA-style reload pins the earlier table instead of choosing a new one.
+    updated = w + torch.randn_like(w) * 0.002
+    packed = eager_w4a8.quantize_w4a8_int8_weight(updated, codebook_tensor=cb)
+    x = torch.randn(64, k, device=DEV, dtype=torch.bfloat16)
+    out = hip.w4a8_int8_linear(x, packed[0], packed[1], packed[2], codebook=packed[4])
+    ref = eager_w4a8.w4a8_int8_linear(x, packed[0], packed[1], packed[2], codebook=packed[4])
+
+    scale = ref.float().abs().max().item()
+    assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale
+
+
+@needs_wmma
+def test_w4a8_linear_asymmetric_matches_eager(hip):
+    """The zero-point correction has no INT8 epilogue; that layout runs off the
+    dequantized weight, which the eager path does too."""
+    torch.manual_seed(0)
+    _, (qdata, s_rel, s_channel, correction, cb) = _quantize_w4a8(
+        128, 512, symmetric=False, codebook=False
+    )
+    assert correction is not None
+    x = torch.randn(64, 512, device=DEV, dtype=torch.bfloat16)
+    kwargs = {"codebook": cb, "correction": correction, "out_dtype": torch.bfloat16}
+
+    out = hip.w4a8_int8_linear(x, qdata, s_rel, s_channel, **kwargs)
+    ref = eager_w4a8.w4a8_int8_linear(x, qdata, s_rel, s_channel, **kwargs)
+
+    torch.testing.assert_close(out.float(), ref.float(), rtol=0, atol=0)
+
+
+@needs_wmma
+def test_w4a8_linear_dispatches_to_hip():
+    torch.manual_seed(0)
+    w = torch.randn(256, 512, device=DEV, dtype=torch.bfloat16) * 0.02
+    qdata, params = AsymW4A8Int8Layout.quantize(w)
+    x = torch.randn(32, 512, device=DEV, dtype=torch.bfloat16)
+
+    impl = registry.get_implementation(
+        "w4a8_int8_linear",
+        kwargs={
+            "x": x,
+            "qdata": qdata,
+            "s_rel": params.scale,
+            "s_channel": params.s_channel,
+            "codebook": params.codebook,
+            "correction": params.correction,
+            "bias": None,
+            "group_size": params.group_size,
+            "convrot_groupsize": params.convrot_groupsize,
+            "out_dtype": torch.bfloat16,
+        },
+    )
+    assert impl.__module__ == "comfy_kitchen.backends.hip"
+
+    out = torch.nn.functional.linear(x, QuantizedTensor(qdata, "AsymW4A8Int8Layout", params))
+    rel = (out.float() - (x @ w.t()).float()).norm() / (x @ w.t()).float().norm()
+    assert out.shape == (32, 256)
+    assert rel < 0.2
+
+
+# 0 and 3 are caught by the positivity and divisibility checks. 2 and 12 divide
+# their K and only the vector layout rejects them: 2 is under the four scales a
+# vector loads, 12 neither divides 16 nor is a multiple of it.
+@pytest.mark.parametrize(("group_size", "k"), [(0, 256), (3, 256), (2, 256), (12, 48)])
+def test_w4a8_decode_launcher_rejects_an_unsupported_group_size(hip, group_size, k):
+    """Each vector loads four group scales, so the wrappers only reach the kernel
+    with a group of 4, 8, 16 or a multiple of 16; guard the C++ callers too."""
+    qdata = torch.zeros(8, k // 2, dtype=torch.int8, device=DEV)
+    s_rel = torch.ones(8, k // max(group_size, 1), dtype=torch.float32, device=DEV)
+    out = torch.zeros(8, k, dtype=torch.int8, device=DEV)
+
+    with pytest.raises(RuntimeError, match="group_size"):
+        hip._C.dequant_int4_grouped_to_int8(
+            hip._dl(qdata), hip._dl(s_rel), 0, None, hip._dl(out), 8, k, group_size,
+            hip._stream(qdata),
+        )
 
 
 def test_quantize_int8_rowwise_matches_eager():
@@ -736,6 +1021,144 @@ def test_rms_rope_matches_eager(split_half, freqs_dtype, shape, freqs_shape):
     assert torch.equal(out_one, out_q)
 
 
+def _partial_rotary_reference(x, freqs, scale, epsilon, rot_dim):
+    """Norm over the full head_dim, split-half rotation over the first rot_dim."""
+    x_float = x.float()
+    rrms = torch.rsqrt(x_float.square().mean(dim=-1, keepdim=True) + epsilon)
+    x_norm = (x_float * rrms * scale.float()).to(x.dtype).float()
+    half = rot_dim // 2
+    x1, x2 = x_norm[..., :half], x_norm[..., half:rot_dim]
+    f = freqs.float()
+    o1 = f[..., 0, 0] * x1 + f[..., 0, 1] * x2
+    o2 = f[..., 1, 0] * x1 + f[..., 1, 1] * x2
+    return torch.cat([o1, o2, x_norm[..., rot_dim:]], dim=-1).to(x.dtype)
+
+
+@pytest.mark.parametrize("rot_dim", [32, 64, 96])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_rms_rope_partial_rotary(hip, rot_dim, dtype):
+    """rot_dim rotates a head-dim prefix; the tail is normalized but not rotated."""
+    torch.manual_seed(0)
+    s, h, d = 333, 8, 128
+    q = torch.randn(1, s, h, d, device=DEV, dtype=dtype)
+    k = torch.randn(1, s, h, d, device=DEV, dtype=dtype)
+    freqs = torch.randn(1, s, 1, rot_dim // 2, 2, 2, device=DEV, dtype=torch.float32)
+    q_scale = torch.randn(d, device=DEV, dtype=torch.float32)
+    k_scale = torch.randn(d, device=DEV, dtype=torch.float32)
+
+    out_q, out_k = hip.rms_rope_split_half(q, k, freqs, q_scale, k_scale, rot_dim=rot_dim)
+
+    for out, x, scale in ((out_q, q, q_scale), (out_k, k, k_scale)):
+        ref = _partial_rotary_reference(x, freqs, scale, 1e-6, rot_dim)
+        torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
+
+
+def test_rms_rope_partial_rotary_with_an_odd_tail(hip, monkeypatch):
+    """Only the rotated prefix has to be even. A 65-wide row with rot_dim=64 leaves
+    one norm-only element, which the kernel handles, so it must not go to eager."""
+    monkeypatch.setattr(
+        hip._eager, "rms_rope_split_half",
+        lambda *a, **kw: pytest.fail("an odd head_dim with an even rot_dim fell back"),
+    )
+    torch.manual_seed(0)
+    s, h, d, rot_dim = 64, 4, 65, 64
+    q = torch.randn(1, s, h, d, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn(1, s, h, d, device=DEV, dtype=torch.bfloat16)
+    freqs = torch.randn(1, s, 1, rot_dim // 2, 2, 2, device=DEV, dtype=torch.float32)
+    scale = torch.randn(d, device=DEV, dtype=torch.float32)
+
+    out_q, out_k = hip.rms_rope_split_half(q, k, freqs, scale, scale, rot_dim=rot_dim)
+
+    for out, x in ((out_q, q), (out_k, k)):
+        ref = _partial_rotary_reference(x, freqs, scale, 1e-6, rot_dim)
+        torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
+
+
+def test_rms_rope_full_rot_dim_matches_the_default(hip):
+    """rot_dim == head_dim must be bit-identical to omitting it."""
+    torch.manual_seed(0)
+    s, h, d = 128, 4, 64
+    q = torch.randn(1, s, h, d, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn(1, s, h, d, device=DEV, dtype=torch.bfloat16)
+    freqs = torch.randn(1, s, 1, d // 2, 2, 2, device=DEV, dtype=torch.float32)
+    scale = torch.randn(d, device=DEV, dtype=torch.float32)
+
+    full = hip.rms_rope_split_half(q, k, freqs, scale, scale, rot_dim=d)
+    default = hip.rms_rope_split_half(q, k, freqs, scale, scale)
+
+    assert torch.equal(full[0], default[0])
+    assert torch.equal(full[1], default[1])
+
+
+def test_rms_rope_partial_rotary_in_place_on_a_qkv_slice(hip):
+    """The MiniMax layout: q and k are strided slices of one packed projection."""
+    torch.manual_seed(0)
+    s, h, d, rot_dim = 96, 6, 128, 96
+    qkv = torch.randn(s, 3 * h * d, device=DEV, dtype=torch.bfloat16)
+    qkv_ref = qkv.clone()
+    freqs = torch.randn(1, s, 1, rot_dim // 2, 2, 2, device=DEV, dtype=torch.float32)
+    scale = torch.randn(d, device=DEV, dtype=torch.float32)
+
+    q, k, v = (t.view(1, s, h, d) for t in qkv.split(h * d, dim=-1))
+    q_ref, k_ref, v_ref = (t.view(1, s, h, d) for t in qkv_ref.split(h * d, dim=-1))
+
+    hip.rms_rope_split_half_(q, k, freqs, scale, scale, rot_dim=rot_dim)
+    expect_q, expect_k = hip.rms_rope_split_half(
+        q_ref, k_ref, freqs, scale, scale, rot_dim=rot_dim)
+
+    assert torch.equal(q, expect_q)
+    assert torch.equal(k, expect_k)
+    assert torch.equal(v, v_ref), "v must not be touched by in-place q/k rope"
+
+
+@pytest.mark.parametrize("rot_dim", [33, 66], ids=["odd", "over head_dim"])
+def test_rms_rope_rejects_an_unusable_rot_dim(hip, rot_dim):
+    """The rotation pairs (i, i + rot_dim/2) inside head_dim, so an odd prefix or
+    one wider than the row has no kernel."""
+    q = torch.randn(1, 8, 2, 64, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn(1, 8, 2, 64, device=DEV, dtype=torch.bfloat16)
+    freqs = torch.randn(1, 8, 1, rot_dim // 2, 2, 2, device=DEV, dtype=torch.float32)
+    scale = torch.randn(64, device=DEV, dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match="rot_dim"):
+        hip.rms_rope_split_half(q, k, freqs, scale, scale, rot_dim=rot_dim)
+
+
+def test_rms_rope_forwards_rot_dim_to_the_eager_fallback(hip, monkeypatch):
+    """A weight the kernel cannot index goes back to eager, which must still be
+    told the rotation is partial: dropping rot_dim there rotates the whole row."""
+    q = torch.randn(1, 8, 2, 64, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn(1, 8, 2, 64, device=DEV, dtype=torch.bfloat16)
+    freqs = torch.randn(1, 8, 1, 24, 2, 2, device=DEV, dtype=torch.float32)
+    scale = torch.randn(1, 64, device=DEV, dtype=torch.float32)  # 2D: no kernel
+
+    seen = {}
+    monkeypatch.setattr(
+        hip._eager, "rms_rope_split_half",
+        lambda *a, **kw: seen.update(kw) or (torch.zeros_like(q), torch.zeros_like(k)),
+    )
+    hip.rms_rope_split_half(q, k, freqs, scale, scale, rot_dim=48)
+
+    assert seen.get("rot_dim") == 48, "eager fallback lost rot_dim"
+
+
+def test_rms_rope_partial_rotary_with_mismatched_q_k_heads(hip):
+    """GQA splits the pair into two single-tensor launches; both need rot_dim."""
+    torch.manual_seed(0)
+    s, d, rot_dim = 65, 128, 96
+    q = torch.randn(1, s, 8, d, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn(1, s, 2, d, device=DEV, dtype=torch.bfloat16)
+    freqs = torch.randn(1, s, 1, rot_dim // 2, 2, 2, device=DEV, dtype=torch.float32)
+    q_scale = torch.randn(d, device=DEV, dtype=torch.float32)
+    k_scale = torch.randn(d, device=DEV, dtype=torch.float32)
+
+    out_q, out_k = hip.rms_rope_split_half(q, k, freqs, q_scale, k_scale, rot_dim=rot_dim)
+
+    for out, x, scale in ((out_q, q, q_scale), (out_k, k, k_scale)):
+        ref = _partial_rotary_reference(x, freqs, scale, 1e-6, rot_dim)
+        torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
+
+
 @pytest.mark.parametrize("split_half", [False, True])
 def test_rms_rope_reads_a_qkv_slice_in_place(hip, split_half):
     """A q/k pair sliced out of a packed qkv must match the copy bit for bit."""
@@ -827,7 +1250,7 @@ def test_rms_rope_rejects_a_short_weight(hip):
             q.__dlpack__(stream=-1), None, freqs.__dlpack__(stream=-1),
             torch.randn(32, device=DEV).__dlpack__(stream=-1), None,
             q_out.__dlpack__(stream=-1), None,
-            1e-6, False, torch.cuda.current_stream(q.device).cuda_stream,
+            1e-6, False, torch.cuda.current_stream(q.device).cuda_stream, 0,
         )
 
 

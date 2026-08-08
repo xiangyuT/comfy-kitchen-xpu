@@ -10,6 +10,8 @@
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
 
+#include "launchers.h"
+
 namespace nb = nanobind;
 
 // Maps a DLPack dtype onto comfy_kitchen.backends.eager.quantization.DTYPE_TO_CODE:
@@ -42,8 +44,6 @@ void launch_stochastic_round_fp8_kernel(void*, const void*, int64_t, int, int, i
 
 void launch_scaled_mm_fp8_kernel(const void*, const void*, void*, const void*, const void*,
                                  const void*, int, int, int, int, int, hipStream_t);
-void launch_int8_gemm_kernel(const void*, const void*, void*, const void*, const void*, int,
-                             const void*, int, int, int, int, int, hipStream_t);
 void launch_convrot_w4a4_gemm_kernel(const void*, const void*, void*, const void*, const void*,
                                      const void*, int, int, int, int, int, hipStream_t);
 
@@ -78,8 +78,8 @@ void launch_apply_rope_kernel(const void*, const void*, const void*, void*, void
 void launch_rms_rope_kernel(const void*, const void*, const void*, const void*, const void*, void*,
                             void*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                             int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int, int, int,
-                            float, bool, hipStream_t);
+                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int, int,
+                            int, float, bool, hipStream_t);
 }
 
 static void check_hip_launch() {
@@ -315,8 +315,8 @@ void int8_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> 
     require_bias(bias, N, kFn);
 
     launch_int8_gemm_kernel(a.data(), b.data(), c.data(), scale_a.data(), scale_b.data(),
-                            scale_b_stride, opt_data(bias), opt_code(bias), M, N, K, out_code,
-                            reinterpret_cast<hipStream_t>(stream_ptr));
+                            scale_b_stride, opt_data(bias), opt_code(bias), M, N, K, N /*ldc*/,
+                            out_code, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -391,7 +391,10 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
     require_convrot_group(K, group_size, kFn);
     require_dtype(x, 0, 2, kFn, "x");
     require_dtype(q, 4, 4, kFn, "q");
-    require_len(x, static_cast<int64_t>(M) * K, kFn, "x");
+    // K is the activated (written) width; swiglu (code 2, see INPUT_ACT_TO_CODE)
+    // reads a [gate | up] row twice as wide. The launcher rejects unknown codes.
+    const int64_t in_width = act_code == 2 ? 2 : 1;
+    require_len(x, static_cast<int64_t>(M) * K * in_width, kFn, "x");
     require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
 
@@ -525,6 +528,84 @@ void unpack_int4(nb::ndarray<> q, nb::ndarray<> out, int64_t nbytes, uintptr_t s
     check_hip_launch();
 }
 
+// scale_code names the s_rel storage: 0 float32, 5 e4m3 (crossing as uint8, as
+// elsewhere). codebook is optional; without it the levels are uniform.
+void dequant_int4_grouped_to_int8(nb::ndarray<> qdata, nb::ndarray<> s_rel, int scale_code,
+                                  OptArray codebook, nb::ndarray<> out, int N, int K,
+                                  int group_size, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "dequant_int4_grouped_to_int8";
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    require_positive(group_size, kFn, "group_size");
+    if (scale_code != 0 && scale_code != 5) {
+        throw std::runtime_error(std::string(kFn) + ": s_rel must be float32 or float8_e4m3fn");
+    }
+    if (K % group_size != 0) {
+        throw std::runtime_error(std::string(kFn) + ": group_size must divide K");
+    }
+    require_dtype(qdata, 4, 4, kFn, "qdata");
+    require_dtype(out, 4, 4, kFn, "out");
+    require_dtype(s_rel, scale_code == 0 ? 0 : 3, scale_code == 0 ? 0 : 3, kFn, "s_rel");
+    require_len(qdata, static_cast<int64_t>(N) * (K / 2), kFn, "qdata");
+    require_len(out, static_cast<int64_t>(N) * K, kFn, "out");
+    require_len(s_rel, static_cast<int64_t>(N) * (K / group_size), kFn, "s_rel");
+    if (codebook.has_value()) {
+        require_scale_len(*codebook, 16, kFn, "codebook");
+    }
+
+    launch_dequant_int4_grouped_to_int8_kernel(
+        qdata.data(), s_rel.data(), scale_code, opt_data(codebook), out.data(), N, K, group_size,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// Chunked W4A8: decode chunk_cols weight columns at a time and run the INT8 GEMM
+// on each chunk, writing an N-wide slice of out. xq/xs are the already rotated and
+// quantized activation, so the loop only touches the weight.
+void w4a8_int8_gemm_chunked(nb::ndarray<> xq, nb::ndarray<> qdata, nb::ndarray<> s_rel,
+                            int scale_code, OptArray codebook, nb::ndarray<> s_channel,
+                            nb::ndarray<> xs, OptArray bias, nb::ndarray<> workspace,
+                            nb::ndarray<> out, int M, int N, int K, int group_size, int chunk_cols,
+                            int out_code, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "w4a8_int8_gemm_chunked";
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    require_positive(group_size, kFn, "group_size");
+    require_positive(chunk_cols, kFn, "chunk_cols");
+    if (scale_code != 0 && scale_code != 5) {
+        throw std::runtime_error(std::string(kFn) + ": s_rel must be float32 or float8_e4m3fn");
+    }
+    if (K % group_size != 0) {
+        throw std::runtime_error(std::string(kFn) + ": group_size must divide K");
+    }
+    require_dtype(xq, 4, 4, kFn, "xq");
+    require_dtype(qdata, 4, 4, kFn, "qdata");
+    require_dtype(workspace, 4, 4, kFn, "workspace");
+    require_dtype(out, 0, 2, kFn, "out");
+    require_out_matches(out, out_code, kFn);
+    require_dtype(s_rel, scale_code == 0 ? 0 : 3, scale_code == 0 ? 0 : 3, kFn, "s_rel");
+    require_len(xq, static_cast<int64_t>(M) * K, kFn, "xq");
+    require_len(qdata, static_cast<int64_t>(N) * (K / 2), kFn, "qdata");
+    require_len(s_rel, static_cast<int64_t>(N) * (K / group_size), kFn, "s_rel");
+    require_len(out, static_cast<int64_t>(M) * N, kFn, "out");
+    // Every chunk decodes into the same scratch, so it has to hold the widest one.
+    require_len(workspace, static_cast<int64_t>(chunk_cols < N ? chunk_cols : N) * K, kFn,
+                "workspace");
+    require_scale_len(s_channel, static_cast<size_t>(N), kFn, "s_channel");
+    require_scale_len(xs, static_cast<size_t>(M), kFn, "xs");
+    require_bias(bias, N, kFn);
+    if (codebook.has_value()) {
+        require_scale_len(*codebook, 16, kFn, "codebook");
+    }
+
+    launch_w4a8_int8_gemm_chunked_kernel(
+        xq.data(), qdata.data(), s_rel.data(), scale_code, opt_data(codebook), s_channel.data(),
+        xs.data(), opt_data(bias), opt_code(bias), workspace.data(), out.data(), M, N, K,
+        group_size, chunk_cols, out_code, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
 // subtract_mean selects LayerNorm (adaln) or RMSNorm (rms_adaln) statistics.
 static void adaln_impl(const char* kFn, nb::ndarray<>& x, nb::ndarray<>& scale,
                        nb::ndarray<>& shift, nb::ndarray<>& out, int N, int D, int scale_group,
@@ -571,27 +652,35 @@ void rms_adaln(nb::ndarray<> x, nb::ndarray<> scale, nb::ndarray<> shift, nb::nd
                /*subtract_mean=*/false, stream_ptr);
 }
 
-// x is (batch, dim1, dim2, head_dim); freqs is (fb, fd1, fd2, head_dim/2, 2, 2).
+// x is (batch, dim1, dim2, head_dim); freqs is (fb, fd1, fd2, rot_dim/2, 2, 2).
 // Shapes and strides are read off the arrays so the broadcast rules stay in one
 // place rather than being recomputed on the Python side. Shared by apply_rope and
-// rms_rope, which index both tensors the same way.
-static void require_rope_shapes(const nb::ndarray<>& x, const nb::ndarray<>& freqs,
-                                const char* fn) {
+// rms_rope, which index both tensors the same way. rot_dim is the rotated head-dim
+// prefix; 0 rotates everything.
+static int64_t require_rope_shapes(const nb::ndarray<>& x, const nb::ndarray<>& freqs,
+                                   const char* fn, int64_t rot_dim = 0) {
     // map_dtype_to_code returns -1 for anything else, which the device decoder
     // would misread; the other operands are checked against x's dtype separately.
     require_dtype(x, 0, 2, fn, "x");
     require_dtype(freqs, 0, 2, fn, "freqs_cis");
     if (x.ndim() != 4) throw std::runtime_error(std::string(fn) + " expects a 4D input");
     if (freqs.ndim() != 6) throw std::runtime_error(std::string(fn) + " expects a 6D freqs_cis");
-    if (x.shape(3) % 2 != 0) {
-        throw std::runtime_error(std::string(fn) + " expects an even head_dim");
+
+    // Only the rotated prefix is paired, so an odd head_dim is fine as long as the
+    // resolved rot is even: the leftover tail is norm-only. apply_rope stays
+    // covered because its rot resolves to head_dim.
+    const int64_t head_dim = static_cast<int64_t>(x.shape(3));
+    const int64_t rot = rot_dim > 0 ? rot_dim : head_dim;
+    if (rot % 2 != 0 || rot > head_dim) {
+        throw std::runtime_error(std::string(fn) + " expects an even rot_dim <= head_dim");
     }
 
-    // The kernel indexes freqs as (fb, fd1, fd2, head_dim/2, 2, 2), broadcasting a
+    // The kernel indexes freqs as (fb, fd1, fd2, rot_dim/2, 2, 2), broadcasting a
     // leading dim only when it is 1. Anything else walks off the end of the array.
-    if (freqs.shape(3) != x.shape(3) / 2 || freqs.shape(4) != 2 || freqs.shape(5) != 2) {
+    if (freqs.shape(3) != static_cast<size_t>(rot / 2) || freqs.shape(4) != 2 ||
+        freqs.shape(5) != 2) {
         throw std::runtime_error(std::string(fn) +
-                                 " expects freqs_cis trailing dims (head_dim/2, 2, 2)");
+                                 " expects freqs_cis trailing dims (rot_dim/2, 2, 2)");
     }
     for (size_t i = 0; i < 3; ++i) {
         if (freqs.shape(i) != 1 && freqs.shape(i) != x.shape(i)) {
@@ -600,6 +689,7 @@ static void require_rope_shapes(const nb::ndarray<>& x, const nb::ndarray<>& fre
                 " expects each leading freqs_cis dim to be 1 or match the input");
         }
     }
+    return rot;
 }
 
 // An output is walked with its own strides, so it only has to match the extents.
@@ -670,9 +760,9 @@ void apply_rope(nb::ndarray<> xq, OptArray xk, nb::ndarray<> freqs, nb::ndarray<
 // weight for each input.
 void rms_rope(nb::ndarray<> q, OptArray k, nb::ndarray<> freqs, nb::ndarray<> q_scale,
               OptArray k_scale, nb::ndarray<> q_out, OptArray k_out, float epsilon,
-              bool split_half, uintptr_t stream_ptr) {
+              bool split_half, uintptr_t stream_ptr, int64_t rot_dim) {
     constexpr const char* kFn = "rms_rope";
-    require_rope_shapes(q, freqs, kFn);
+    const int64_t rot = require_rope_shapes(q, freqs, kFn, rot_dim);
 
     // k, its scale and its output are one operand set.
     if (k.has_value() != k_out.has_value() || k.has_value() != k_scale.has_value()) {
@@ -701,7 +791,7 @@ void rms_rope(nb::ndarray<> q, OptArray k, nb::ndarray<> freqs, nb::ndarray<> q_
         k_scale.has_value() ? k_scale->data() : nullptr, q_out.data(),
         k_out.has_value() ? k_out->data() : nullptr,
         static_cast<int64_t>(q.shape(0)), static_cast<int64_t>(q.shape(1)),
-        static_cast<int64_t>(q.shape(2)), head_dim,
+        static_cast<int64_t>(q.shape(2)), head_dim, rot,
         static_cast<int64_t>(freqs.shape(0)), static_cast<int64_t>(freqs.shape(1)),
         static_cast<int64_t>(freqs.shape(2)),
         static_cast<int64_t>(q.stride(0)), static_cast<int64_t>(q.stride(1)),
@@ -867,6 +957,8 @@ NB_MODULE(_C, m) {
     m.def("convrot_quant_int4", &convrot_quant_int4);
     m.def("convrot_max_k", &convrot_max_k_host);
     m.def("unpack_int4", &unpack_int4);
+    m.def("dequant_int4_grouped_to_int8", &dequant_int4_grouped_to_int8);
+    m.def("w4a8_int8_gemm_chunked", &w4a8_int8_gemm_chunked);
     m.def("adaln", &adaln);
     m.def("rms_adaln", &rms_adaln);
     m.def("apply_rope", &apply_rope);

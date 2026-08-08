@@ -23,8 +23,8 @@ the upstream maintainers and contributors for the library architecture,
 operator APIs, QuantizedTensor design, backend registry, eager/CUDA/Triton
 implementations, packaging, and tests on which this work is built.
 
-The XPU development line is based on upstream Comfy Kitchen `0.2.26` at
-[`255a438`](https://github.com/Comfy-Org/comfy-kitchen/commit/255a43879fe57bbcbecfdb273b46d772b00c5a90).
+The XPU development line is based on upstream Comfy Kitchen `0.2.28` at
+[`75aa2ab`](https://github.com/Comfy-Org/comfy-kitchen/commit/75aa2ab6f9f45575205489b9593cf9fe01a57028).
 The Intel-specific work in this fork is intentionally optional: importing
 Comfy Kitchen remains safe when PyTorch XPU, `omni_xpu_kernel`, its native
 extension, or Intel GPU hardware is absent.
@@ -126,7 +126,7 @@ git clone https://github.com/xiangyuT/comfy-kitchen-xpu.git
 cd comfy-kitchen-xpu
 python -m pip install build
 python -m build --wheel
-pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.26-py3-none-any.whl
+pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.28-py3-none-any.whl
 ```
 
 The repository retains upstream CUDA source to keep future upstream updates

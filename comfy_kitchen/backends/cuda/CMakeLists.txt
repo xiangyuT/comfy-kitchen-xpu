@@ -131,9 +131,11 @@ set(CUDA_SOURCES
     ops/convrot_w4a4.cu
     ops/turing_int4.cu
     ops/rms_rope.cu
+    ops/na3d.cu
     ops/quantize_svdquant_w4a4.cu
     ops/scaled_mm_svdquant_w4a4.cu
     ops/awq_w4a16.cu
+    ops/w4a8_gemm.cu
     ops/adaln.cu
 )
 

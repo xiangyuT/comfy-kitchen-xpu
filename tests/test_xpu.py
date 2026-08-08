@@ -1,7 +1,7 @@
 """Native smoke and parity tests for the optional omni XPU backend.
 
-Executable contract baseline: Comfy Kitchen v0.2.26 at
-255a43879fe57bbcbecfdb273b46d772b00c5a90.  XPU-specific ports live here so
+Executable contract baseline: Comfy Kitchen v0.2.28 at
+75aa2ab6f9f45575205489b9593cf9fe01a57028.  XPU-specific ports live here so
 upstream's generic CUDA/Triton/eager tests remain easy to resync.  In
 particular, the RMS-RoPE cases mirror ``TestPartialRotary`` in
 ``test_rms_rope.py`` and the activation cases mirror ``TestInputActQuantizer``,
