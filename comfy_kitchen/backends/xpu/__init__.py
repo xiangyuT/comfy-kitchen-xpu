@@ -6,6 +6,7 @@ import sys
 
 import torch
 
+from comfy_kitchen.allocation import allocation_context
 from comfy_kitchen.constraints import (
     ExactDims, FunctionConstraints, ParamConstraint, sol_attn_common_call_rule,
 )
@@ -286,6 +287,8 @@ except (ImportError, OSError, RuntimeError) as exc:
 if _AVAILABLE:
     try:
         from omni_xpu_kernel.cute import sol_attn_v2 as _sol
+        if hasattr(_sol, "set_allocation_context_factory"):
+            _sol.set_allocation_context_factory(allocation_context)
         _SOL_AVAILABLE = _sol.is_available()
         if not _SOL_AVAILABLE:
             _SOL_ERROR = "the Sol sidecar does not expose the complete native API"

@@ -170,6 +170,40 @@ def test_xpu_rope_arbitrary_matrix_pair_semantics(split_half, layout):
     torch.testing.assert_close(actual_k, expected_k, rtol=rtol, atol=atol)
 
 
+def test_xpu_rope_layout_cache_uses_kitchen_allocation_context():
+    from omni_xpu_kernel.cute import sol_attn_v2
+
+    class CountingContext:
+        entries = 0
+
+        def __enter__(self):
+            self.entries += 1
+
+        def __exit__(self, *_exc):
+            return False
+
+    t, rot = 3, 8
+    freqs = torch.arange(t * rot * 2, device="xpu", dtype=torch.float32)
+    freqs = freqs.reshape(t, rot // 2, 2, 2).transpose(0, 1)
+    assert not freqs.is_contiguous()
+    context = CountingContext()
+    ck.set_allocation_context(context)
+    try:
+        first = sol_attn_v2._cached_rope_freqs(freqs, t, rot)
+        second = sol_attn_v2._cached_rope_freqs(freqs, t, rot)
+        assert first is second
+        assert context.entries == 1
+        torch.testing.assert_close(first, freqs.reshape(1, t, 1, rot // 2, 2, 2))
+        freqs.add_(1)
+        updated = sol_attn_v2._cached_rope_freqs(freqs, t, rot)
+        assert updated is not first
+        assert context.entries == 2
+        torch.testing.assert_close(updated, freqs.reshape(1, t, 1, rot // 2, 2, 2))
+    finally:
+        ck.set_allocation_context(None)
+        sol_attn_v2._ROPE_FREQ_CACHE.clear()
+
+
 @pytest.mark.parametrize("scale_dtype", [torch.float32, torch.bfloat16])
 def test_xpu_h3_packed_qkv_partial_rms_rope_inplace(scale_dtype):
     sequence, heads, head_dim, rot_dim = 37, 56, 128, 96
@@ -439,6 +473,24 @@ def test_xpu_int8_linear_single_row_bias_and_dtype(dtype):
         expected = ck.int8_linear(x, qweight, scale, bias, dtype)
     error = (actual.float() - expected.float()).abs()
     assert actual.shape == (1, 96)
+    assert actual.dtype == dtype
+    assert error.mean().item() < 0.15
+    assert error.max().item() < 0.75
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_xpu_int8_linear_two_row_ar_cfg_matches_eager(dtype):
+    """The two-row AR/CFG route retains Kitchen's public scale/bias contract."""
+    x = torch.randn(2, 256, device="xpu", dtype=dtype)
+    weight = torch.randn(96, 256, device="xpu", dtype=dtype)
+    bias = torch.randn(96, device="xpu", dtype=dtype)
+    with ck.use_backend("xpu"):
+        qweight, scale = ck.quantize_int8_tensorwise(weight)
+        actual = ck.int8_linear(x, qweight, scale, bias, dtype)
+    with ck.use_backend("eager"):
+        expected = ck.int8_linear(x, qweight, scale, bias, dtype)
+    error = (actual.float() - expected.float()).abs()
+    assert actual.shape == (2, 96)
     assert actual.dtype == dtype
     assert error.mean().item() < 0.15
     assert error.max().item() < 0.75
