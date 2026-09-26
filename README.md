@@ -103,17 +103,17 @@ means that the requested public path has no working XPU implementation.
 | INT8 rowwise/tensorwise quantize and simple dequantize | Native | Includes output-dtype dequantize. |
 | INT8 ConvRot quantize/dequantize and `int8_linear` | Native | RMSNorm, ConvRot and residual routes use companion kernels when available. |
 | SVDQuant W4A4 and ConvRot W4A4 | Native | Companion INT4 and INT8 kernels. |
-| FP16 linear and Conv3D | Native, numeric gap | Large-shape paths currently accumulate in FP32; CUDA-style FP16 accumulation remains open. |
-| GroupNorm+SiLU+pad3d | Native | Current API uses reflect spatial padding and returns a new tensor. |
+| FP16 linear and Conv3D | Native, numeric gap | Conv3D accepts strided input and `out` views; large-shape paths still accumulate in FP32. |
+| GroupNorm+SiLU+pad3d | Native | Reflect or zero spatial padding, strided input and `out` views. |
 | Gated Delta decode and DeltaNet convolution | Native | Companion decode kernels. |
 | AWQ W4A16 GEMV | Fallback | PyTorch eager; no Kitchen XPU capability. |
 | NVFP4 and MXFP8 quantize/dequantize/matmul | Fallback | Triton or PyTorch eager where their constraints allow; no Kitchen XPU capability. |
 | W4A8 quantized linear | Deferred | Its XPU native implementation is deferred. |
 
-Upstream `main` has additional changes after this fork's source base. In
-particular, W6A8, 256-dimensional Flash decode, and `zero_pad`/`out`/strided
-view forms for Conv3D and GroupNorm are **not yet integrated** into this fork.
-Their XPU status is tracked separately from the current `0.2.35` API. Runtime
+Upstream `main` has additional changes after this fork's source base. The
+`zero_pad`/`out`/strided-view forms for Conv3D and GroupNorm are selectively
+integrated here. W6A8 and 256-dimensional Flash decode are **not yet
+integrated** into the fork. Runtime
 capability detection is the authority for the installed companion wheel:
 `ck.list_backends()["xpu"]["capabilities"]`.
 

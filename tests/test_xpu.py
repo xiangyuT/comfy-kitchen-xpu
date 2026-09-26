@@ -41,6 +41,63 @@ def test_xpu_fp16_conv3d_uses_native_route():
     assert "fp16_conv3d" in ck.list_backends()["xpu"]["capabilities"]
 
 
+def test_xpu_fp16_conv3d_strided_input_writes_frame_view():
+    torch.manual_seed(20260927)
+    base = torch.randn(1, 64, 4, 20, 20, device="xpu", dtype=torch.float16)
+    x = base[:, :, :, 1:19, 1:19]
+    weight = torch.randn(64, 64, 3, 3, 3, device="xpu", dtype=torch.float16) * 0.02
+    bias = torch.randn(64, device="xpu", dtype=torch.float16)
+    full = torch.full(
+        (1, 64, 4, 16, 16), 7.0, device="xpu", dtype=torch.float16,
+    ).contiguous(memory_format=torch.channels_last_3d)
+    out = full[:, :, 1:3]
+    with ck.use_backend("xpu"):
+        actual = ck.fp16_conv3d(x, weight, bias, out=out)
+    expected = torch.nn.functional.conv3d(x, weight, bias)
+    from tests.conftest import fp16_accum_tol, rel_err
+
+    assert actual.data_ptr() == out.data_ptr()
+    assert rel_err(actual.float(), expected.float()) < fp16_accum_tol(64 * 27)
+    assert bool((full[:, :, 0] == 7).all())
+    assert bool((full[:, :, 3] == 7).all())
+    assert "fp16_conv3d_out" in ck.list_backends()["xpu"]["capabilities"]
+
+
+def test_xpu_fp16_conv3d_two_batch_out_view_preserves_other_frames():
+    x = torch.randn(2, 4, 3, 5, 5, device="xpu", dtype=torch.float16)
+    weight = torch.randn(6, 4, 2, 3, 3, device="xpu", dtype=torch.float16)
+    full = torch.full(
+        (2, 6, 4, 3, 3), 7.0, device="xpu", dtype=torch.float16,
+    ).contiguous(memory_format=torch.channels_last_3d)
+    out = full[:, :, 1:3]
+    with ck.use_backend("xpu"):
+        ck.fp16_conv3d(x, weight, out=out)
+    expected = torch.nn.functional.conv3d(x, weight)
+    from tests.conftest import fp16_accum_tol, rel_err
+
+    assert rel_err(out.float(), expected.float()) < fp16_accum_tol(4 * 2 * 3 * 3)
+    assert bool((full[:, :, 0] == 7).all())
+    assert bool((full[:, :, 3] == 7).all())
+
+
+def test_xpu_fp16_conv3d_out_fullgraph_compile():
+    x = torch.randn(1, 4, 3, 5, 5, device="xpu", dtype=torch.float16)
+    weight = torch.randn(6, 4, 2, 3, 3, device="xpu", dtype=torch.float16)
+    eager_out = torch.empty(1, 6, 2, 3, 3, device="xpu", dtype=torch.float16)
+    compiled_out = torch.empty_like(eager_out)
+
+    def run(inp, dst):
+        return ck.fp16_conv3d(inp, weight, out=dst)
+
+    with ck.use_backend("xpu"):
+        expected = run(x, eager_out)
+        actual = torch.compile(run, backend="eager", fullgraph=True)(
+            x, compiled_out,
+        )
+    assert actual.data_ptr() == compiled_out.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_xpu_group_norm_silu_pad3d_uses_native_route():
     x = torch.randn(1, 32, 2, 4, 4, device="xpu", dtype=torch.float32)
     weight = torch.randn(32, device="xpu", dtype=torch.float32)
@@ -57,6 +114,59 @@ def test_xpu_group_norm_silu_pad3d_uses_native_route():
     expected = torch.nn.functional.pad(expected, (0, 0, 0, 0, 1, 0))
     torch.testing.assert_close(actual, expected)
     assert "group_norm_silu_pad3d" in ck.list_backends()["xpu"]["capabilities"]
+
+
+def test_xpu_group_norm_zero_pad_accepts_wide_border_and_strided_input():
+    base = torch.randn(1, 32, 2, 2, 4, device="xpu", dtype=torch.float16)
+    x = base[..., ::2]
+    assert not x.is_contiguous()
+    pad = (3, 3, 3, 3, 0)
+    with ck.use_backend("xpu"):
+        actual = ck.group_norm_silu_pad3d(
+            x, None, None, 1, 0.0, pad, silu=False, zero_pad=True,
+        )
+    expected = torch.nn.functional.pad(x, (3, 3, 3, 3, 0, 0))
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_xpu_group_norm_zero_pad_writes_frame_offset_out_view():
+    x = torch.randn(1, 32, 2, 4, 5, device="xpu", dtype=torch.float16)
+    weight = torch.randn(32, device="xpu", dtype=torch.float16)
+    bias = torch.randn(32, device="xpu", dtype=torch.float16)
+    pad = (1, 1, 1, 1, 0)
+    buffer = torch.full(
+        (1, 32, 4, 6, 7), 7.0, device="xpu", dtype=torch.float16,
+    ).contiguous(memory_format=torch.channels_last_3d)
+    view = buffer[:, :, 2:]
+    with ck.use_backend("xpu"):
+        expected = ck.group_norm_silu_pad3d(
+            x, weight, bias, 8, 1e-6, pad, zero_pad=True,
+        )
+        actual = ck.group_norm_silu_pad3d(
+            x, weight, bias, 8, 1e-6, pad, zero_pad=True, out=view,
+        )
+    assert actual.data_ptr() == view.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert bool((buffer[:, :, :2] == 7).all())
+    assert "group_norm_silu_pad3d_out" in ck.list_backends()["xpu"]["capabilities"]
+
+
+def test_xpu_group_norm_out_fullgraph_compile():
+    x = torch.randn(1, 8, 2, 4, 5, device="xpu", dtype=torch.float16)
+    eager_out = torch.empty(1, 8, 2, 6, 7, device="xpu", dtype=torch.float16)
+    compiled_out = torch.empty_like(eager_out)
+
+    def run(inp, out):
+        return ck.group_norm_silu_pad3d(
+            inp, None, None, 1, 0.0, (1, 1, 1, 1, 0),
+            silu=False, zero_pad=True, out=out,
+        )
+
+    with ck.use_backend("xpu"):
+        expected = run(x, eager_out)
+        actual = torch.compile(run, backend="eager", fullgraph=True)(x, compiled_out)
+    assert actual.data_ptr() == compiled_out.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_xpu_fp16_linear_uses_native_route():

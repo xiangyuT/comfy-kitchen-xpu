@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch
 
 __all__ = [
+    "with_out_param",
     "DivisibleBy",
     "ExactDims",
     "FunctionConstraints",
@@ -210,6 +211,12 @@ def validate_param(
             return ValidationResult.fail(name, f"shape {list(value.shape)} fails: {rule.describe()}")
 
     return ValidationResult.ok()
+
+
+def with_out_param(base: FunctionConstraints) -> FunctionConstraints:
+    """Add a 5-D output tensor with the input's dtype to an op's constraints."""
+    out = ParamConstraint(dtypes=base.params["x"].dtypes, shape_rules=(ExactDims(5),))
+    return replace(base, params={**base.params, "out": out})
 
 
 def validate_function_call(

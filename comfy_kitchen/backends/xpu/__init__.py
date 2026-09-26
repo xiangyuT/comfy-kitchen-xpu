@@ -9,6 +9,7 @@ import torch
 from comfy_kitchen.allocation import allocation_context
 from comfy_kitchen.constraints import (
     ExactDims, FunctionConstraints, ParamConstraint, sol_attn_common_call_rule,
+    with_out_param,
 )
 from comfy_kitchen.registry import registry
 
@@ -58,8 +59,10 @@ __all__ = [
     "gated_delta_decode_fused",
     "deltanet_conv_step",
     "group_norm_silu_pad3d",
+    "group_norm_silu_pad3d_out",
     "fp16_linear",
     "fp16_conv3d",
+    "fp16_conv3d_out",
 ]
 
 _AVAILABLE = False
@@ -79,8 +82,10 @@ _GGUF_AVAILABLE = False
 _SOL_AVAILABLE = False
 _SOL_ERROR = None
 _GROUP_NORM_SILU_PAD3D_AVAILABLE = False
+_GROUP_NORM_SILU_PAD3D_OUT_AVAILABLE = False
 _FP16_LINEAR_AVAILABLE = False
 _FP16_CONV3D_AVAILABLE = False
+_FP16_CONV3D_OUT_AVAILABLE = False
 _RMS_NORM_FOR_INT8_AVAILABLE = False
 _RMS_NORM_QUANTIZE_AVAILABLE = False
 _RMS_NORM_CONVROT_QUANT_AVAILABLE = False
@@ -123,16 +128,36 @@ def gated_delta_decode_fused(
     )
 
 
-def group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu):
+def group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu,
+                          zero_pad=False):
     from omni_xpu_kernel import kitchen
 
     if min(pad) < 0:
         raise ValueError("group_norm_silu_pad3d: padding must be non-negative")
+    if zero_pad and not _GROUP_NORM_SILU_PAD3D_OUT_AVAILABLE:
+        from comfy_kitchen.backends.eager import group_norm_silu_pad3d as eager_group_norm
+        return eager_group_norm(
+            x, weight, bias, num_groups, eps, pad, silu, zero_pad,
+        )
     return kitchen.group_norm_silu_pad3d(
         x,
         None if weight is None else weight.to(x.dtype),
         None if bias is None else bias.to(x.dtype),
-        num_groups, eps, tuple(pad), silu,
+        num_groups, eps, tuple(pad), silu, zero_pad,
+    )
+
+
+def group_norm_silu_pad3d_out(x, weight, bias, num_groups, eps, pad, silu,
+                              zero_pad, out):
+    from omni_xpu_kernel import kitchen
+
+    if min(pad) < 0:
+        raise ValueError("group_norm_silu_pad3d: padding must be non-negative")
+    kitchen.group_norm_silu_pad3d_out(
+        x,
+        None if weight is None else weight.to(x.dtype),
+        None if bias is None else bias.to(x.dtype),
+        num_groups, eps, tuple(pad), silu, zero_pad, out,
     )
 
 
@@ -155,6 +180,17 @@ def fp16_conv3d(x, weight, bias=None, residual=None, stride=None):
         None if bias is None else bias.to(x.dtype),
         None if residual is None else residual.to(x.dtype),
         tuple((1, 1, 1) if stride is None else stride),
+    )
+
+
+def fp16_conv3d_out(x, weight, bias, residual, stride, out):
+    from omni_xpu_kernel import kitchen
+
+    kitchen.fp16_conv3d_out(
+        x, weight,
+        None if bias is None else bias.to(x.dtype),
+        None if residual is None else residual.to(x.dtype),
+        stride, out,
     )
 
 _REQUIRED_NATIVE_INT8_OPS = frozenset(
@@ -184,6 +220,10 @@ try:
             _native_kitchen is not None
             and hasattr(_native_kitchen, "group_norm_silu_pad3d")
         )
+        _GROUP_NORM_SILU_PAD3D_OUT_AVAILABLE = (
+            _native_kitchen is not None
+            and hasattr(_native_kitchen, "group_norm_silu_pad3d_out")
+        )
         _FP16_LINEAR_AVAILABLE = (
             _native_kitchen is not None
             and hasattr(_native_kitchen, "fp16_linear")
@@ -191,6 +231,10 @@ try:
         _FP16_CONV3D_AVAILABLE = (
             _native_kitchen is not None
             and hasattr(_native_kitchen, "fp16_conv3d")
+        )
+        _FP16_CONV3D_OUT_AVAILABLE = (
+            _native_kitchen is not None
+            and hasattr(_native_kitchen, "fp16_conv3d_out")
         )
         _RMS_NORM_FOR_INT8_AVAILABLE = (
             _native_kitchen is not None
@@ -845,6 +889,10 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
             },
             default_devices=xpu,
         )
+        if _GROUP_NORM_SILU_PAD3D_OUT_AVAILABLE:
+            capabilities["group_norm_silu_pad3d_out"] = with_out_param(
+                capabilities["group_norm_silu_pad3d"]
+            )
     if _FP16_LINEAR_AVAILABLE:
         capabilities["fp16_linear"] = FunctionConstraints(
             params={
@@ -866,6 +914,10 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
             },
             default_devices=xpu,
         )
+        if _FP16_CONV3D_OUT_AVAILABLE:
+            capabilities["fp16_conv3d_out"] = with_out_param(
+                capabilities["fp16_conv3d"]
+            )
     if _FP8_QDQ_AVAILABLE:
         fp8_dtypes = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
         capabilities.update(
