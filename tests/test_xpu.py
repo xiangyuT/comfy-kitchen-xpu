@@ -757,6 +757,31 @@ def test_xpu_int8_linear_rms_norm_and_residual_compile():
     torch.testing.assert_close(actual, expected)
 
 
+def test_xpu_int8_rms_norm_convrot_residual_compile():
+    x = torch.randn(2, 256, device="xpu", dtype=torch.bfloat16)
+    weight = torch.randint(-127, 128, (64, 256), device="xpu", dtype=torch.int8)
+    weight_scale = torch.tensor(0.01, device="xpu")
+    norm_weight = torch.randn(256, device="xpu", dtype=torch.bfloat16)
+    residual = torch.randn(2, 64, device="xpu", dtype=torch.bfloat16)
+    residual_scale = torch.randn(64, device="xpu", dtype=torch.bfloat16)
+
+    def run(input, norm, add, add_scale):
+        return ck.int8_linear(
+            input, weight, weight_scale, out_dtype=torch.bfloat16,
+            convrot=True, convrot_groupsize=256,
+            input_act="rms_norm", input_act_weight=norm,
+            input_act_eps=1e-6, residual=add,
+            residual_scale=add_scale,
+        )
+
+    with ck.use_backend("xpu"):
+        expected = run(x, norm_weight, residual, residual_scale)
+        actual = torch.compile(run, backend="eager", fullgraph=True)(
+            x, norm_weight, residual, residual_scale,
+        )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_xpu_int8_primitive_cache_hits():
     from omni_xpu_kernel import int8
 

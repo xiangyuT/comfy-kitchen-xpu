@@ -83,6 +83,7 @@ _FP16_LINEAR_AVAILABLE = False
 _FP16_CONV3D_AVAILABLE = False
 _RMS_NORM_FOR_INT8_AVAILABLE = False
 _RMS_NORM_QUANTIZE_AVAILABLE = False
+_RMS_NORM_CONVROT_QUANT_AVAILABLE = False
 _SCALED_RESIDUAL_AVAILABLE = False
 _FUSED_RESIDUAL_AVAILABLE = False
 
@@ -198,6 +199,10 @@ try:
         _RMS_NORM_QUANTIZE_AVAILABLE = (
             _native_kitchen is not None
             and hasattr(_native_kitchen, "rms_norm_quantize_int8")
+        )
+        _RMS_NORM_CONVROT_QUANT_AVAILABLE = (
+            _native_kitchen is not None
+            and hasattr(_native_kitchen, "rms_norm_convrot_quantize_int8")
         )
         _SCALED_RESIDUAL_AVAILABLE = (
             _native_kitchen is not None
@@ -450,7 +455,18 @@ if _AVAILABLE:
                 norm_weight = input_act_weight.to(x.dtype).contiguous()
                 from omni_xpu_kernel import kitchen
 
-                if _RMS_NORM_QUANTIZE_AVAILABLE and not convrot:
+                if (
+                    convrot
+                    and _RMS_NORM_CONVROT_QUANT_AVAILABLE
+                    and convrot_groupsize in (64, 256)
+                    and x.dtype in (torch.float16, torch.bfloat16)
+                    and x.shape[-1] % convrot_groupsize == 0
+                ):
+                    prepared = kitchen.rms_norm_convrot_quantize_int8(
+                        x, norm_weight, input_act_eps, convrot_groupsize,
+                    )
+                    convrot = False
+                elif _RMS_NORM_QUANTIZE_AVAILABLE and not convrot:
                     prepared = kitchen.rms_norm_quantize_int8(
                         x, norm_weight, input_act_eps,
                     )

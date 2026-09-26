@@ -80,9 +80,42 @@ The original upstream CUDA and generic-backend README is retained
   validation.
 - XPU operator tests, portable tensor tests, and self-hosted device workflows.
 
-Excluding the explicitly deferred NVFP4, MXFP8, and AWQ formats, the XPU
-backend registers each capability independently from the native symbols
+The XPU backend registers each capability independently from the native symbols
 available in the installed companion wheel.
+
+## XPU support matrix
+
+This matrix describes the fork's upstream `0.2.35` API at `b2a2972` and the
+matching `omni_xpu_kernel` companion package. **Native** means that Kitchen
+registers an XPU backend capability; it does not imply that every dtype, shape,
+or layout takes that path. **Fallback** means that dispatch uses Triton or
+PyTorch eager code on XPU, so it is still an XPU native-kernel gap. **Missing**
+means that the requested public path has no working XPU implementation.
+
+| Public operation | XPU status | Scope |
+| --- | --- | --- |
+| FP8 per-tensor quantize/dequantize and stochastic rounding | Native | Companion FP8 kernels. |
+| AdaLN and RMS-AdaLN | Native | Companion norm kernels. |
+| `na2d`, `na3d` | Fallback | Triton or PyTorch eager; no Kitchen XPU capability. |
+| `sol_attn` | Native | Supported BF16/FP16 shapes only. |
+| `int8_attention`, prequantized INT8 attention, Flash decode | Missing | The public attention modules still require CUDA or HIP. |
+| All eight RoPE forms and their in-place forms | Native | Includes RMS-RoPE and split-half layouts. |
+| INT8 rowwise/tensorwise quantize and simple dequantize | Native | Includes output-dtype dequantize. |
+| INT8 ConvRot quantize/dequantize and `int8_linear` | Native | RMSNorm, ConvRot and residual routes use companion kernels when available. |
+| SVDQuant W4A4 and ConvRot W4A4 | Native | Companion INT4 and INT8 kernels. |
+| FP16 linear and Conv3D | Native, numeric gap | Large-shape paths currently accumulate in FP32; CUDA-style FP16 accumulation remains open. |
+| GroupNorm+SiLU+pad3d | Native | Current API uses reflect spatial padding and returns a new tensor. |
+| Gated Delta decode and DeltaNet convolution | Native | Companion decode kernels. |
+| AWQ W4A16 GEMV | Fallback | PyTorch eager; no Kitchen XPU capability. |
+| NVFP4 and MXFP8 quantize/dequantize/matmul | Fallback | Triton or PyTorch eager where their constraints allow; no Kitchen XPU capability. |
+| W4A8 quantized linear | Deferred | Its XPU native implementation is deferred. |
+
+Upstream `main` has additional changes after this fork's source base. In
+particular, W6A8, 256-dimensional Flash decode, and `zero_pad`/`out`/strided
+view forms for Conv3D and GroupNorm are **not yet integrated** into this fork.
+Their XPU status is tracked separately from the current `0.2.35` API. Runtime
+capability detection is the authority for the installed companion wheel:
+`ck.list_backends()["xpu"]["capabilities"]`.
 
 ## XPU backend behavior
 
@@ -209,7 +242,8 @@ revision/version and XPU target.
 
 - Intel XPU support remains experimental and is not an upstream Comfy Kitchen
   release claim.
-- NVFP4, MXFP8, and AWQ are explicitly deferred for XPU.
+- NVFP4, MXFP8, and AWQ currently use fallback implementations on XPU and
+  remain native-kernel gaps.
 - The W4A8 decode GEMV optimization is deferred for XPU.
 - Native wheels are CPython-, Torch-ABI-, and target-specific.
 - BMG and PTL-H performance numbers are not portable across devices.
@@ -249,7 +283,6 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `rms_adaln`                 | ✓     | ✓    | ✓      | ✓   |
 | `na3d`                      | ✓     | ✓    | ✓      | ✓   |
 | `na2d`                      | ✓     | ✓    | ✓      | ✓   |
-| `sol_attn`                  | ✓     | ✓    |        | ✓   |
 | `int8_attention`            |       | ✓    |        | ✓   |
 | `apply_rope`                | ✓     | ✓    | ✓      | ✓   |
 | `apply_rope1`               | ✓     | ✓    | ✓      | ✓   |
@@ -469,7 +502,7 @@ python setup.py build_ext --debug-build --lineinfo bdist_wheel
 ### Requirements
 
 - **Python**: ≥3.10
-- **PyTorch**: ≥2.7.0
+- **PyTorch**: ≥2.5.0
 - **CUDA Runtime** (for CUDA wheels): ≥13.0
   - Pre-built wheels require NVIDIA Driver r580+
   - Building from source requires CUDA Toolkit ≥12.8 and `CUDA_HOME` environment variable
