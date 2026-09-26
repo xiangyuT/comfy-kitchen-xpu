@@ -89,6 +89,7 @@ set(CUDA_NVCC_FLAGS
     --expt-relaxed-constexpr
     --expt-extended-lambda
     --use_fast_math
+    --compress-mode=size
 )
 
 # Pass MSVC standard-conforming preprocessor flag to nvcc (required by CCCL 2.8+)
@@ -126,6 +127,9 @@ set(CUDA_SOURCES
     ops/cublas_gemm_nvfp4.cu
     ops/cublas_gemm_int8.cu
     ops/cutlass_gemm_int8.cu
+    ops/cutlass_gemm_fp16.cu
+    ops/cutlass_conv3d_fp16.cu
+    ops/group_norm_pad3d.cu
     ops/turing_int8.cu
     ops/int8_linear.cu
     ops/convrot_w4a4.cu
@@ -145,6 +149,7 @@ set(CUDA_SOURCES
     ops/w4a8_gemm.cu
     ops/adaln.cu
     ops/flash_decode.cu
+    ops/gated_delta.cu
     sage_attention/quant_v_int8.cu
     sage_attention/quant_qk_int8.cu
     sage_attention/sage_attn_launcher.cu

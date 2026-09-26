@@ -47,10 +47,15 @@ void launch_scaled_mm_fp8_kernel(const void*, const void*, void*, const void*, c
                                  const void*, int, int, int, int, int, hipStream_t);
 void launch_convrot_w4a4_gemm_kernel(const void*, const void*, void*, const void*, const void*,
                                      const void*, int, int, int, int, int, hipStream_t);
+bool launch_fp16_gemm_kernel(const void*, const void*, void*, const void*, const void*,
+                             const void*, int, int, int, hipStream_t);
+bool launch_fp16_conv3d_kernel(const void*, const void*, const void*, const void*, void*, int, int,
+                               int, int, int, int, int, int, int, int, int, int, int, int, int,
+                               hipStream_t);
 
 void launch_quantize_int8_rowwise_kernel(const void*, int, void*, void*, int, int, hipStream_t);
 void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, void*, void*, int, int,
-                                         int, int, hipStream_t);
+                                         int, int, const void*, float, hipStream_t);
 void launch_quantize_int8_tensorwise_kernel(const void*, int, void*, void*, void*, int64_t,
                                             hipStream_t);
 void launch_dequantize_int8_simple_kernel(const void*, const void*, void*, int64_t, int64_t, int,
@@ -64,6 +69,18 @@ int convrot_int8_needs_spill_host(int, int, int);
 
 void launch_quantize_w4a8_convrot_kernel(const void*, const void*, void*, void*, void*, int64_t,
                                          int64_t, int, bool, uint64_t, hipStream_t);
+bool launch_w4a8_codebook_gemv_kernel(const void* xq, const void* qw, const void* s_rel,
+                                      const void* codebook, const void* s_channel, const void* xs,
+                                      const void* bias, int bias_code, void* out, int out_code,
+                                      int M, int N, int K, int group_size, hipStream_t stream);
+bool launch_gated_delta_decode_fused_kernel(
+    const void* mixed_qkv, const void* x, const void* w_a, const void* w_b, const void* dt_bias,
+    const void* g_decay, void* state, void* out, void* snapshots, const void* z,
+    const void* norm_w, float eps, int B, int Hv, int Hk, int S, int DK, int DV, int C, int Hd,
+    int key_dim, float scale, int dtype_code, hipStream_t stream);
+bool launch_deltanet_conv_step_kernel(const void* proj, void* conv_state, const void* conv_w,
+                                      const void* conv_b, void* conv_out, void* conv_snaps, int B,
+                                      int C, int S, int KS, int dtype_code, hipStream_t stream);
 int w4a8_requant_max_k_kernel();
 void launch_na3d_kernel(const void*, const void*, const void*, void*, int, int, int, int, int, int,
                         int, int, int, int, int, int, float, int, hipStream_t);
@@ -81,6 +98,9 @@ void launch_sage_int8_attn(const void*, const void*, const void*, void*, const v
 
 void launch_adaln_kernel(const void*, const void*, const void*, void*, int, int, int, int, float,
                          int, int, int, bool, hipStream_t);
+void launch_group_norm_silu_pad3d(const void*, const void*, const void*, void*, void*, int, int,
+                                  int, int, int, int, float, int, int, int, int, int, bool, int,
+                                  hipStream_t);
 void launch_gemv_awq_kernel(const void*, const void*, const void*, const void*, const void*, void*,
                             int, int, int, int, int, int, int, int, hipStream_t);
 void launch_svdquant_lora_down_kernel(const void*, const void*, void*, int, int, int, int, int,
@@ -368,6 +388,85 @@ void convrot_w4a4_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::nd
     check_hip_launch();
 }
 
+static void require_fp16(const nb::ndarray<>& t, const char* fn, const char* name) {
+    require_dtype(t, 1, 1, fn, name);
+}
+
+// D = A @ B^T + bias, or resid + rscale * (that). Every operand is fp16; false means
+// the caller serves the shape.
+bool fp16_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> d, OptArray bias, OptArray rscale,
+               OptArray resid, int M, int N, int K, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "fp16_gemm";
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    require_fp16(a, kFn, "a");
+    require_fp16(b, kFn, "b");
+    require_fp16(d, kFn, "d");
+    require_len(a, static_cast<int64_t>(M) * K, kFn, "a");
+    require_len(b, static_cast<int64_t>(N) * K, kFn, "b");
+    require_len(d, static_cast<int64_t>(M) * N, kFn, "d");
+    if (bias.has_value()) {
+        require_fp16(*bias, kFn, "bias");
+        require_len(*bias, N, kFn, "bias");
+    }
+    if (rscale.has_value() != resid.has_value()) {
+        throw std::runtime_error(std::string(kFn) + ": rscale and resid must be given together");
+    }
+    if (resid.has_value()) {
+        require_fp16(*rscale, kFn, "rscale");
+        require_fp16(*resid, kFn, "resid");
+        require_len(*rscale, N, kFn, "rscale");
+        require_len(*resid, static_cast<int64_t>(M) * N, kFn, "resid");
+    }
+    const bool served = launch_fp16_gemm_kernel(
+        a.data(), b.data(), d.data(), opt_data(bias), opt_data(rscale), opt_data(resid), M, N, K,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return served;
+}
+
+// NDHWC conv3d, zero padding, x [N, D, H, W, C] and w [K, T, R, S, C] fp16 in that
+// memory order; out and resid are [N, Z, P, Q, K]. false means the caller serves it.
+bool fp16_conv3d(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, OptArray resid,
+                 nb::ndarray<> out, int N, int D, int H, int W, int C, int K, int T, int R, int S,
+                 int sd, int sh, int sw, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "fp16_conv3d";
+    require_nonneg(N, kFn, "N");
+    require_positive(C, kFn, "C");
+    require_nonneg(K, kFn, "K");
+    require_positive(T, kFn, "T");
+    require_positive(R, kFn, "R");
+    require_positive(S, kFn, "S");
+    require_positive(sd, kFn, "sd");
+    require_positive(sh, kFn, "sh");
+    require_positive(sw, kFn, "sw");
+    if (D < T || H < R || W < S) {
+        throw std::runtime_error(std::string(kFn) + ": input smaller than the filter");
+    }
+    const int Z = (D - T) / sd + 1, P = (H - R) / sh + 1, Q = (W - S) / sw + 1;
+    const int64_t outs = static_cast<int64_t>(N) * Z * P * Q * K;
+    require_fp16(x, kFn, "x");
+    require_fp16(w, kFn, "w");
+    require_fp16(out, kFn, "out");
+    require_len(x, static_cast<int64_t>(N) * D * H * W * C, kFn, "x");
+    require_len(w, static_cast<int64_t>(K) * T * R * S * C, kFn, "w");
+    require_len(out, outs, kFn, "out");
+    if (bias.has_value()) {
+        require_fp16(*bias, kFn, "bias");
+        require_len(*bias, K, kFn, "bias");
+    }
+    if (resid.has_value()) {
+        require_fp16(*resid, kFn, "resid");
+        require_len(*resid, outs, kFn, "resid");
+    }
+    const bool served = launch_fp16_conv3d_kernel(
+        x.data(), w.data(), opt_data(bias), opt_data(resid), out.data(), N, D, H, W, C, K, T, R, S,
+        Z, P, Q, sd, sh, sw, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return served;
+}
+
 // The int4 quantizers pack two nibbles per byte, so the packed row is K / 2 bytes
 // and an odd K would round it down and drop the tail.
 static void require_convrot_group(int k, int group_size, const char* fn) {
@@ -402,10 +501,12 @@ void quantize_int8_rowwise(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
     check_hip_launch();
 }
 
-// act_code folds an elementwise activation into the rotation's load.
+// act_code folds an activation into the rotation's load. rms_norm (code 3) reads a
+// K-element act_weight in x's dtype and act_eps.
 void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scales,
                            OptArray spill_rotated, OptArray spill_partials, int M, int K,
-                           int group_size, int act_code, uintptr_t stream_ptr) {
+                           int group_size, int act_code, uintptr_t stream_ptr,
+                           OptArray act_weight = std::nullopt, float act_eps = 0.0f) {
     constexpr const char* kFn = "quantize_int8_convrot";
     require_nonneg(M, kFn, "M");
     require_convrot_group(K, group_size, kFn);
@@ -433,10 +534,20 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
         require_len(*spill_partials, static_cast<int64_t>(M) * (K / 256), kFn, "spill_partials");
         spill_partials_ptr = spill_partials->data();
     }
+    if (act_code == 3) {
+        if (!act_weight.has_value()) {
+            throw std::runtime_error(std::string(kFn) + ": rms_norm requires act_weight");
+        }
+        if (map_dtype_to_code(act_weight->dtype()) != map_dtype_to_code(x.dtype())) {
+            throw std::runtime_error(std::string(kFn) + ": act_weight dtype must match x");
+        }
+        require_len(*act_weight, K, kFn, "act_weight");
+    }
 
     launch_quantize_int8_convrot_kernel(x.data(), map_dtype_to_code(x.dtype()), q.data(),
                                         scales.data(), spill_rotated_ptr, spill_partials_ptr, M, K,
                                         group_size, act_code,
+                                        act_code == 3 ? act_weight->data() : nullptr, act_eps,
                                         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
@@ -670,6 +781,48 @@ void w4a8_int8_gemm_chunked(nb::ndarray<> xq, nb::ndarray<> qdata, nb::ndarray<>
     check_hip_launch();
 }
 
+// Decode W4A8: one wave per output column dequantizes the INT4 weight in registers
+// and dots it against the INT8 activation, with no workspace in between. Returns
+// false when the shape is outside its envelope so the caller runs the chunked
+// path instead; the two agree bit for bit where both apply.
+bool w4a8_codebook_gemv(nb::ndarray<> xq, nb::ndarray<> qdata, nb::ndarray<> s_rel,
+                        OptArray codebook, nb::ndarray<> s_channel, nb::ndarray<> xs,
+                        OptArray bias, nb::ndarray<> out, int M, int N, int K, int group_size,
+                        int out_code, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "w4a8_codebook_gemv";
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    require_positive(group_size, kFn, "group_size");
+    if (K % group_size != 0) {
+        throw std::runtime_error(std::string(kFn) + ": group_size must divide K");
+    }
+    require_dtype(xq, 4, 4, kFn, "xq");
+    require_dtype(qdata, 4, 4, kFn, "qdata");
+    require_dtype(out, 0, 2, kFn, "out");
+    require_out_matches(out, out_code, kFn);
+    // The kernel reads the group scale as raw e4m3 bytes; an fp32 s_rel stays on
+    // the chunked path, which dispatches on scale_code.
+    require_dtype(s_rel, 3, 3, kFn, "s_rel");
+    require_len(xq, static_cast<int64_t>(M) * K, kFn, "xq");
+    require_len(qdata, static_cast<int64_t>(N) * (K / 2), kFn, "qdata");
+    require_len(s_rel, static_cast<int64_t>(N) * (K / group_size), kFn, "s_rel");
+    require_len(out, static_cast<int64_t>(M) * N, kFn, "out");
+    require_scale_len(s_channel, static_cast<size_t>(N), kFn, "s_channel");
+    require_scale_len(xs, static_cast<size_t>(M), kFn, "xs");
+    require_bias(bias, N, kFn);
+    if (codebook.has_value()) {
+        require_scale_len(*codebook, 16, kFn, "codebook");
+    }
+
+    const bool used = launch_w4a8_codebook_gemv_kernel(
+        xq.data(), qdata.data(), s_rel.data(), opt_data(codebook), s_channel.data(), xs.data(),
+        opt_data(bias), opt_code(bias), out.data(), out_code, M, N, K, group_size,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return used;
+}
+
 // subtract_mean selects LayerNorm (adaln) or RMSNorm (rms_adaln) statistics.
 static void adaln_impl(const char* kFn, nb::ndarray<>& x, nb::ndarray<>& scale,
                        nb::ndarray<>& shift, nb::ndarray<>& out, int N, int D, int scale_group,
@@ -701,6 +854,58 @@ static void adaln_impl(const char* kFn, nb::ndarray<>& x, nb::ndarray<>& scale,
                         shift_group, eps, map_dtype_to_code(x.dtype()),
                         map_dtype_to_code(scale.dtype()), map_dtype_to_code(shift.dtype()),
                         subtract_mean, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// Per-frame GroupNorm + SiLU + causal conv padding over NDHWC storage. weight and
+// bias absent -> pad only, and the workspace is not read.
+void group_norm_silu_pad3d(nb::ndarray<> x, OptArray weight, OptArray bias, nb::ndarray<> out,
+                           OptArray workspace, int B, int C, int T, int H, int W, int num_groups,
+                           float eps, int left, int right, int top, int bottom, int front,
+                           bool silu, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "group_norm_silu_pad3d";
+    require_nonneg(B, kFn, "B");
+    require_positive(C, kFn, "C");
+    require_nonneg(T, kFn, "T");
+    require_nonneg(H, kFn, "H");
+    require_nonneg(W, kFn, "W");
+    require_nonneg(left, kFn, "left");
+    require_nonneg(right, kFn, "right");
+    require_nonneg(top, kFn, "top");
+    require_nonneg(bottom, kFn, "bottom");
+    require_nonneg(front, kFn, "front");
+    const int code = map_dtype_to_code(x.dtype());
+    if (code != 1 && code != 2) {
+        throw std::runtime_error(std::string(kFn) + ": x must be float16 or bfloat16");
+    }
+    require_dtype(out, code, code, kFn, "out");
+    require_len(x, static_cast<int64_t>(B) * C * T * H * W, kFn, "x");
+    require_len(out,
+                static_cast<int64_t>(B) * C * (T + static_cast<int64_t>(front)) *
+                    (H + static_cast<int64_t>(top) + bottom) *
+                    (W + static_cast<int64_t>(left) + right),
+                kFn, "out");
+    if (weight.has_value() != bias.has_value()) {
+        throw std::runtime_error(std::string(kFn) + ": weight and bias must be given together");
+    }
+    if (weight.has_value()) {
+        require_positive(num_groups, kFn, "num_groups");
+        require_dtype(*weight, code, code, kFn, "weight");
+        require_dtype(*bias, code, code, kFn, "bias");
+        require_len(*weight, C, kFn, "weight");
+        require_len(*bias, C, kFn, "bias");
+        if (!workspace.has_value()) {
+            throw std::runtime_error(std::string(kFn) + ": the norm needs a workspace");
+        }
+        require_dtype(*workspace, 0, 0, kFn, "workspace");
+        const int64_t chunks = (static_cast<int64_t>(H) * W + 1023) / 1024;
+        require_len(*workspace, 2 * static_cast<int64_t>(B) * T * (chunks * C + num_groups), kFn,
+                    "workspace");
+    }
+    launch_group_norm_silu_pad3d(x.data(), opt_data(weight), opt_data(bias), out.data(),
+                                 weight.has_value() ? workspace->data() : nullptr, B, C, T, H, W,
+                                 num_groups, eps, left, right, top, bottom, front, silu, code,
+                                 reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -1104,10 +1309,8 @@ static void sage_check_shapes(const nb::ndarray<>& q, const nb::ndarray<>& k,
     }
 }
 
-// sage_attend synthesizes Q/K/V/O strides from the extents rather than reading
-// them, so anything but the packed row-major layout is read as though it were
-// packed. The Python layer only ever allocates fresh contiguous buffers; a caller
-// reaching _C directly can pass a view.
+// Kernels that synthesize strides from extents instead of reading tensor strides
+// require packed row-major operands, including views passed directly to _C.
 static void require_packed_contiguous(const nb::ndarray<>& t, const char* fn, const char* name) {
     int64_t expected = 1;
     for (int axis = static_cast<int>(t.ndim()) - 1; axis >= 0; --axis) {
@@ -1739,6 +1942,136 @@ void sol_attn_core_py(nb::ndarray<> workspace, nb::ndarray<> out, nb::ndarray<> 
     check_hip_launch();
 }
 
+// Every operand of the DeltaNet kernels is read at one width picked from the
+// activation dtype, so a mismatched one is an out-of-bounds device read.
+static void require_same_dtype(const nb::ndarray<>& t, int dtype_code, const char* fn,
+                               const char* name) {
+    if (map_dtype_to_code(t.dtype()) != dtype_code) {
+        throw std::runtime_error(std::string(fn) + ": " + name +
+                                 " must share the activation dtype");
+    }
+}
+
+// GatedDeltaNet decode: S <= 8 steps of the delta rule for one (batch, value head)
+// per block, with the gate projections, q/k normalization and the gated RMSNorm
+// folded in. state is updated in place; snapshots, when given, records it after
+// steps 0..S-2 for the speculative-decode rollback.
+bool gated_delta_decode_fused(nb::ndarray<> mixed_qkv, nb::ndarray<> x, nb::ndarray<> w_a,
+                              nb::ndarray<> w_b, nb::ndarray<> dt_bias, nb::ndarray<> g_decay,
+                              nb::ndarray<> state, nb::ndarray<> out, OptArray snapshots,
+                              nb::ndarray<> z, nb::ndarray<> norm_w, double eps, int B, int Hv,
+                              int Hk, int S, int DK, int DV, int C, int Hd, int key_dim,
+                              double scale, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "gated_delta_decode_fused";
+    require_positive(B, kFn, "B");
+    require_positive(Hv, kFn, "Hv");
+    require_positive(Hk, kFn, "Hk");
+    require_positive(S, kFn, "S");
+    require_positive(DK, kFn, "DK");
+    require_positive(DV, kFn, "DV");
+    require_positive(Hd, kFn, "Hd");
+    require_positive(key_dim, kFn, "key_dim");
+    if (Hv % Hk != 0 || key_dim != Hk * DK) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": Hk must divide Hv and key_dim must be Hk * DK");
+    }
+    // The kernel splits q, k and v out of one [B, C, S] buffer at fixed offsets.
+    if (C < 2 * key_dim + Hv * DV) {
+        throw std::runtime_error(std::string(kFn) + ": C is too small for 2 * key_dim + Hv * DV");
+    }
+    const int dtype_code = map_dtype_to_code(mixed_qkv.dtype());
+    require_code(dtype_code, 0, 2, kFn, "activation dtype");
+    require_same_dtype(x, dtype_code, kFn, "x");
+    require_same_dtype(w_a, dtype_code, kFn, "w_a");
+    require_same_dtype(w_b, dtype_code, kFn, "w_b");
+    require_same_dtype(out, dtype_code, kFn, "out");
+    require_same_dtype(z, dtype_code, kFn, "z");
+    require_same_dtype(norm_w, dtype_code, kFn, "norm_w");
+    require_len(mixed_qkv, static_cast<int64_t>(B) * C * S, kFn, "mixed_qkv");
+    require_len(x, static_cast<int64_t>(B) * S * Hd, kFn, "x");
+    require_len(w_a, static_cast<int64_t>(Hv) * Hd, kFn, "w_a");
+    require_len(w_b, static_cast<int64_t>(Hv) * Hd, kFn, "w_b");
+    require_len(out, static_cast<int64_t>(B) * S * Hv * DV, kFn, "out");
+    require_len(z, static_cast<int64_t>(B) * S * Hv * DV, kFn, "z");
+    require_len(norm_w, DV, kFn, "norm_w");
+    require_scale_len(dt_bias, static_cast<size_t>(Hv), kFn, "dt_bias");
+    require_scale_len(g_decay, static_cast<size_t>(Hv), kFn, "g_decay");
+    require_scale_len(state, static_cast<size_t>(B) * Hv * DK * DV, kFn, "state");
+    // Reject strided buffers before launch: copying mutable state or snapshots
+    // would lose the in-place update, and treating a view as packed corrupts it.
+    require_packed_contiguous(mixed_qkv, kFn, "mixed_qkv");
+    require_packed_contiguous(x, kFn, "x");
+    require_packed_contiguous(w_a, kFn, "w_a");
+    require_packed_contiguous(w_b, kFn, "w_b");
+    require_packed_contiguous(dt_bias, kFn, "dt_bias");
+    require_packed_contiguous(g_decay, kFn, "g_decay");
+    require_packed_contiguous(state, kFn, "state");
+    require_packed_contiguous(out, kFn, "out");
+    require_packed_contiguous(z, kFn, "z");
+    require_packed_contiguous(norm_w, kFn, "norm_w");
+    void* snap_ptr = nullptr;
+    if (snapshots.has_value() && S > 1) {
+        require_scale_len(*snapshots, static_cast<size_t>(S - 1) * B * Hv * DK * DV, kFn,
+                          "snapshots");
+        require_packed_contiguous(*snapshots, kFn, "snapshots");
+        snap_ptr = snapshots->data();
+    }
+
+    const bool used = launch_gated_delta_decode_fused_kernel(
+        mixed_qkv.data(), x.data(), w_a.data(), w_b.data(), dt_bias.data(), g_decay.data(),
+        state.data(), out.data(), snap_ptr, z.data(), norm_w.data(), static_cast<float>(eps), B,
+        Hv, Hk, S, DK, DV, C, Hd, key_dim, static_cast<float>(scale), dtype_code,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return used;
+}
+
+// Depthwise causal conv decode step with silu. conv_state is updated in place and
+// conv_snaps, when given, records it after steps 0..S-2.
+bool deltanet_conv_step(nb::ndarray<> proj, nb::ndarray<> conv_state, nb::ndarray<> conv_w,
+                        OptArray conv_b, nb::ndarray<> conv_out, OptArray conv_snaps, int B,
+                        int C, int S, int KS, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "deltanet_conv_step";
+    require_positive(B, kFn, "B");
+    require_positive(C, kFn, "C");
+    require_positive(S, kFn, "S");
+    if (KS < 2) {
+        throw std::runtime_error(std::string(kFn) + ": KS must be at least 2");
+    }
+    const int dtype_code = map_dtype_to_code(proj.dtype());
+    require_code(dtype_code, 0, 2, kFn, "activation dtype");
+    require_same_dtype(conv_state, dtype_code, kFn, "conv_state");
+    require_same_dtype(conv_w, dtype_code, kFn, "conv_w");
+    require_same_dtype(conv_out, dtype_code, kFn, "conv_out");
+    require_len(proj, static_cast<int64_t>(B) * S * C, kFn, "proj");
+    require_len(conv_state, static_cast<int64_t>(B) * C * (KS - 1), kFn, "conv_state");
+    require_len(conv_w, static_cast<int64_t>(C) * KS, kFn, "conv_w");
+    require_len(conv_out, static_cast<int64_t>(B) * C * S, kFn, "conv_out");
+    require_packed_contiguous(proj, kFn, "proj");
+    require_packed_contiguous(conv_state, kFn, "conv_state");
+    require_packed_contiguous(conv_w, kFn, "conv_w");
+    require_packed_contiguous(conv_out, kFn, "conv_out");
+    if (conv_b.has_value()) {
+        require_same_dtype(*conv_b, dtype_code, kFn, "conv_b");
+        require_len(*conv_b, C, kFn, "conv_b");
+        require_packed_contiguous(*conv_b, kFn, "conv_b");
+    }
+    void* snaps = nullptr;
+    if (conv_snaps.has_value() && S > 1) {
+        require_same_dtype(*conv_snaps, dtype_code, kFn, "conv_snaps");
+        require_len(*conv_snaps, static_cast<int64_t>(S - 1) * B * C * (KS - 1), kFn,
+                    "conv_snaps");
+        require_packed_contiguous(*conv_snaps, kFn, "conv_snaps");
+        snaps = conv_snaps->data();
+    }
+
+    const bool used = launch_deltanet_conv_step_kernel(
+        proj.data(), conv_state.data(), conv_w.data(), opt_data(conv_b), conv_out.data(), snaps,
+        B, C, S, KS, dtype_code, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return used;
+}
+
 NB_MODULE(_C, m) {
     m.doc() = "ComfyKitchen HIP backend native operations (RDNA2-RDNA4, WMMA on gfx11/gfx12)";
     m.def("sol_attn_plan", &sol_attn_plan_py,
@@ -1776,8 +2109,18 @@ NB_MODULE(_C, m) {
     m.def("scaled_mm_fp8", &scaled_mm_fp8);
     m.def("int8_gemm", &int8_gemm);
     m.def("convrot_w4a4_gemm", &convrot_w4a4_gemm);
+    m.def("fp16_gemm", &fp16_gemm, nb::arg("a"), nb::arg("b"), nb::arg("d"),
+          nb::arg("bias").none(), nb::arg("rscale").none(), nb::arg("resid").none(), nb::arg("M"),
+          nb::arg("N"), nb::arg("K"), nb::arg("stream_ptr"));
+    m.def("fp16_conv3d", &fp16_conv3d, nb::arg("x"), nb::arg("w"), nb::arg("bias").none(),
+          nb::arg("resid").none(), nb::arg("out"), nb::arg("N"), nb::arg("D"), nb::arg("H"),
+          nb::arg("W"), nb::arg("C"), nb::arg("K"), nb::arg("T"), nb::arg("R"), nb::arg("S"),
+          nb::arg("sd"), nb::arg("sh"), nb::arg("sw"), nb::arg("stream_ptr"));
     m.def("quantize_int8_rowwise", &quantize_int8_rowwise);
-    m.def("quantize_int8_convrot", &quantize_int8_convrot);
+    m.def("quantize_int8_convrot", &quantize_int8_convrot, nb::arg("x"), nb::arg("q"),
+          nb::arg("scales"), nb::arg("spill_rotated").none(), nb::arg("spill_partials").none(),
+          nb::arg("M"), nb::arg("K"), nb::arg("group_size"), nb::arg("act_code"),
+          nb::arg("stream_ptr"), nb::arg("act_weight") = nb::none(), nb::arg("act_eps") = 0.0f);
     m.def("quantize_int8_tensorwise", &quantize_int8_tensorwise);
     m.def("dequantize_int8_simple", &dequantize_int8_simple);
     m.def("dequantize_int8_convrot_weight", &dequantize_int8_convrot_weight);
@@ -1790,6 +2133,17 @@ NB_MODULE(_C, m) {
     m.def("quantize_w4a8_convrot", &quantize_w4a8_convrot);
     m.def("w4a8_requant_max_k", &w4a8_requant_max_k_kernel);
     m.def("w4a8_int8_gemm_chunked", &w4a8_int8_gemm_chunked);
+    m.def("w4a8_codebook_gemv", &w4a8_codebook_gemv);
+    m.def("gated_delta_decode_fused", &gated_delta_decode_fused, nb::arg("mixed_qkv"),
+          nb::arg("x"), nb::arg("w_a"), nb::arg("w_b"), nb::arg("dt_bias"), nb::arg("g_decay"),
+          nb::arg("state"), nb::arg("out"), nb::arg("snapshots").none(), nb::arg("z"),
+          nb::arg("norm_w"), nb::arg("eps"), nb::arg("B"), nb::arg("Hv"), nb::arg("Hk"),
+          nb::arg("S"), nb::arg("DK"), nb::arg("DV"), nb::arg("C"), nb::arg("Hd"),
+          nb::arg("key_dim"), nb::arg("scale"), nb::arg("stream_ptr"));
+    m.def("deltanet_conv_step", &deltanet_conv_step, nb::arg("proj"), nb::arg("conv_state"),
+          nb::arg("conv_w"), nb::arg("conv_b").none(), nb::arg("conv_out"),
+          nb::arg("conv_snaps").none(), nb::arg("B"), nb::arg("C"), nb::arg("S"), nb::arg("KS"),
+          nb::arg("stream_ptr"));
     m.def("na3d", &na3d);
     m.def("flash_attention_decode", &flash_attention_decode, nb::arg("q"), nb::arg("k"),
           nb::arg("v"), nb::arg("kv_lengths"), nb::arg("output"), nb::arg("softmax_lse"),
@@ -1810,6 +2164,11 @@ NB_MODULE(_C, m) {
           nb::arg("output_dtype_code"), nb::arg("stream_ptr"), nb::arg("attn_mask") = nb::none());
     m.def("adaln", &adaln);
     m.def("rms_adaln", &rms_adaln);
+    m.def("group_norm_silu_pad3d", &group_norm_silu_pad3d, nb::arg("x"), nb::arg("weight").none(),
+          nb::arg("bias").none(), nb::arg("out"), nb::arg("workspace").none(), nb::arg("B"),
+          nb::arg("C"), nb::arg("T"), nb::arg("H"), nb::arg("W"), nb::arg("num_groups"),
+          nb::arg("eps"), nb::arg("left"), nb::arg("right"), nb::arg("top"), nb::arg("bottom"),
+          nb::arg("front"), nb::arg("silu"), nb::arg("stream_ptr"));
     m.def("apply_rope", &apply_rope);
     m.def("rms_rope", &rms_rope);
     m.def("gemv_awq_w4a16", &gemv_awq_w4a16);

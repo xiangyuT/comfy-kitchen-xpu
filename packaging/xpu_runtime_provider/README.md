@@ -11,7 +11,7 @@ Build the normal XPU wheel first, then run:
 
 ```bash
 python packaging/xpu_runtime_provider/build_wheel.py \
-  --source-wheel dist/comfy_kitchen-0.2.33-py3-none-any.whl \
+  --source-wheel dist/comfy_kitchen-0.2.35-py3-none-any.whl \
   --output-dir dist/provider \
   --source-revision "$(git rev-parse HEAD)" \
   --torch-version 2.13.0+xpu \

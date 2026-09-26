@@ -32,13 +32,13 @@ def _load_builder():
 
 
 def _source_wheel(path: Path, *, distribution: str = "comfy-kitchen") -> Path:
-    dist_info = "comfy_kitchen-0.2.33.dist-info"
+    dist_info = "comfy_kitchen-0.2.35.dist-info"
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr(
             f"{dist_info}/METADATA",
             "Metadata-Version: 2.4\n"
             f"Name: {distribution}\n"
-            "Version: 0.2.33\n"
+            "Version: 0.2.35\n"
             "Requires-Python: >=3.10\n",
         )
         archive.writestr(
@@ -61,7 +61,7 @@ def test_provider_wheel_has_disjoint_top_level_and_verified_manifest(
 ):
     monkeypatch.setenv("SOURCE_DATE_EPOCH", "1700000000")
     builder = _load_builder()
-    source = _source_wheel(tmp_path / "comfy_kitchen-0.2.33-py3-none-any.whl")
+    source = _source_wheel(tmp_path / "comfy_kitchen-0.2.35-py3-none-any.whl")
 
     provider = builder.build_provider_wheel(
         source_wheel=source,
@@ -71,7 +71,7 @@ def test_provider_wheel_has_disjoint_top_level_and_verified_manifest(
         xpu_target=xpu_target,
     )
 
-    assert provider.name == "comfy_kitchen_xpu_runtime-0.2.33-py3-none-any.whl"
+    assert provider.name == "comfy_kitchen_xpu_runtime-0.2.35-py3-none-any.whl"
     with zipfile.ZipFile(provider) as archive:
         names = set(archive.namelist())
         assert not any(name.startswith("comfy_kitchen/") for name in names)
@@ -80,7 +80,7 @@ def test_provider_wheel_has_disjoint_top_level_and_verified_manifest(
         )
         assert vendored in names
         assert (
-            "comfy_kitchen_xpu_runtime-0.2.33.dist-info/entry_points.txt"
+            "comfy_kitchen_xpu_runtime-0.2.35.dist-info/entry_points.txt"
             in names
         )
         manifest = json.loads(
@@ -90,7 +90,7 @@ def test_provider_wheel_has_disjoint_top_level_and_verified_manifest(
         assert manifest["canonical_import"] == "comfy_kitchen"
         assert manifest["canonical_distribution"] == {
             "name": "comfy-kitchen",
-            "compatible_versions": ["0.2.33"],
+            "compatible_versions": ["0.2.35"],
         }
         assert manifest["source"]["revision"] == "a" * 40
         assert manifest["source"]["wheel_sha256"] == hashlib.sha256(
@@ -108,7 +108,7 @@ def test_provider_wheel_has_disjoint_top_level_and_verified_manifest(
         ).hexdigest()
 
         entry_points = archive.read(
-            "comfy_kitchen_xpu_runtime-0.2.33.dist-info/entry_points.txt"
+            "comfy_kitchen_xpu_runtime-0.2.35.dist-info/entry_points.txt"
         ).decode()
         assert "[comfyui_omnixpu.runtime_providers]" in entry_points
         assert (
@@ -120,7 +120,7 @@ def test_provider_wheel_has_disjoint_top_level_and_verified_manifest(
             csv.reader(
                 io.StringIO(
                     archive.read(
-                        "comfy_kitchen_xpu_runtime-0.2.33.dist-info/RECORD"
+                        "comfy_kitchen_xpu_runtime-0.2.35.dist-info/RECORD"
                     ).decode()
                 )
             )
@@ -132,7 +132,7 @@ def test_provider_wheel_has_disjoint_top_level_and_verified_manifest(
 def test_provider_wheel_is_reproducible(tmp_path, monkeypatch):
     monkeypatch.setenv("SOURCE_DATE_EPOCH", "1700000000")
     builder = _load_builder()
-    source = _source_wheel(tmp_path / "comfy_kitchen-0.2.33-py3-none-any.whl")
+    source = _source_wheel(tmp_path / "comfy_kitchen-0.2.35-py3-none-any.whl")
     arguments = {
         "source_wheel": source,
         "source_revision": "b" * 40,
@@ -153,7 +153,7 @@ def test_provider_wheel_is_reproducible(tmp_path, monkeypatch):
 def test_provider_builder_rejects_an_unrelated_distribution(tmp_path):
     builder = _load_builder()
     source = _source_wheel(
-        tmp_path / "unrelated-0.2.33-py3-none-any.whl",
+        tmp_path / "unrelated-0.2.35-py3-none-any.whl",
         distribution="unrelated",
     )
 
@@ -170,7 +170,7 @@ def test_provider_builder_rejects_an_unrelated_distribution(tmp_path):
 @pytest.mark.parametrize("target", ["a770", "unknown", "DG2"])
 def test_provider_builder_rejects_unknown_target(tmp_path, target):
     builder = _load_builder()
-    source = _source_wheel(tmp_path / "comfy_kitchen-0.2.33-py3-none-any.whl")
+    source = _source_wheel(tmp_path / "comfy_kitchen-0.2.35-py3-none-any.whl")
     with pytest.raises(ValueError, match="xpu target must be"):
         builder.build_provider_wheel(
             source_wheel=source, output_directory=tmp_path / "dist",
