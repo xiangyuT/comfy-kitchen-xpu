@@ -379,10 +379,10 @@ def fp16_conv3d(
     residual: torch.Tensor | None = None,
     stride: int | tuple[int, int, int] = 1,
 ) -> torch.Tensor:
-    """fp16-accumulate conv3d with bias and residual fused into the epilogue.
+    """Conv3D with optional bias and residual epilogue.
 
-    x [N, C, D, H, W], weight [K, C, T, R, S], zero padding only. Same opt-in
-    numerics as fp16_linear; shapes the kernel declines run torch's conv.
+    x [N, C, D, H, W], weight [K, C, T, R, S], zero padding only. CUDA uses
+    FP16 accumulation; the current XPU implementation accumulates in FP32.
     """
     stride = [stride] * 3 if isinstance(stride, int) else list(stride)
     return torch.ops.comfy_kitchen.fp16_conv3d(x, weight, bias, residual, stride)
@@ -1006,10 +1006,10 @@ def fp16_linear(
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """fp16-accumulate linear, optionally with ``residual + residual_scale * out`` fused.
+    """FP16 linear with optional ``residual + residual_scale * out`` epilogue.
 
-    Same numerics as ``torch.backends.cuda.matmul.allow_fp16_accumulation``, so
-    route here only when the user opted into that mode.
+    CUDA uses the numerics of ``torch.backends.cuda.matmul.allow_fp16_accumulation``.
+    The current XPU implementation accumulates in FP32.
     """
     if x.device.type == "cuda" and not _fp16_linear_fills_gpu(
         x.shape[:-1].numel(), weight.shape[0], weight.shape[1]
@@ -1070,13 +1070,14 @@ def int8_linear(
             ("gelu_tanh", "swiglu", "rms_norm", or None). When
             the fused ConvRot quantizer handles the shape it is folded in, so
             an MLP's ``linear(act(proj(x)))`` or a pre-norm block's
-            ``linear(rms_norm(x))`` never writes the intermediate to HBM;
-            every other path applies it eagerly for identical results.
+            ``linear(rms_norm(x))`` avoids an intermediate where supported.
+            XPU RMSNorm currently uses a separate native kernel.
         input_act_weight: K-element norm weight, required for "rms_norm".
         input_act_eps: Norm eps for "rms_norm".
         residual: Optional [..., N] tensor; the result becomes
             ``residual + residual_scale * linear(x)`` (a pre-norm block's
-            addcmul), fused into the GEMM epilogue where supported.
+            addcmul), fused into the GEMM epilogue where supported. XPU
+            currently applies it with a separate native kernel.
         residual_scale: Per-channel [N] scale for the residual form.
 
     Returns:

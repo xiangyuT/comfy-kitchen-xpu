@@ -88,3 +88,39 @@ def test_xpu_fp16_conv3d_rejects_bad_residual():
     residual = torch.zeros(1, 8, 2, 8, 8, device="xpu", dtype=torch.float16)
     with ck.use_backend("xpu"), pytest.raises(RuntimeError, match="residual"):
         ck.fp16_conv3d(x, weight, residual=residual)
+
+
+@pytest.mark.parametrize("channels,frames,height,width", [
+    (512, 7, 18, 18),
+    (64, 3, 6, 6),
+])
+def test_xpu_fp16_conv3d_deep_and_small_stages(
+    channels, frames, height, width, seed,
+):
+    x = torch.randn(1, channels, frames, height, width,
+                    device="xpu", dtype=torch.float16)
+    weight = torch.randn(channels, channels, 3, 3, 3,
+                         device="xpu", dtype=torch.float16) * 0.02
+    residual = torch.randn(1, channels, frames - 2, height - 2, width - 2,
+                           device="xpu", dtype=torch.float16)
+    with ck.use_backend("xpu"):
+        actual = ck.fp16_conv3d(x, weight, residual=residual)
+    expected = functional.conv3d(x.float(), weight.float()) + residual.float()
+    assert actual.is_contiguous(memory_format=torch.channels_last_3d)
+    assert rel_err(actual.float(), expected.float()) < fp16_accum_tol(channels * 27)
+
+
+def test_xpu_fp16_conv3d_public_fullgraph(seed):
+    x = torch.randn(1, 4, 4, 5, 5, device="xpu", dtype=torch.float16)
+    weight = torch.randn(8, 4, 2, 2, 2, device="xpu", dtype=torch.float16)
+    residual = torch.randn(1, 8, 3, 4, 4, device="xpu", dtype=torch.float16)
+
+    def run(input, kernel, add):
+        return ck.fp16_conv3d(input, kernel, residual=add)
+
+    with ck.use_backend("xpu"):
+        expected = run(x, weight, residual)
+        actual = torch.compile(run, backend="eager", fullgraph=True)(
+            x, weight, residual,
+        )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
