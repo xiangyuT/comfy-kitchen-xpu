@@ -4,12 +4,6 @@ import torch
 
 from .backends import xpu as _xpu_backend
 
-try:
-    from .backends import cuda as _cuda_backend
-except ImportError:
-    # The XPU wheel retains CUDA source but does not package its backend.
-    _cuda_backend = None
-
 if getattr(torch.version, "hip", None):
     from .backends import hip as _hip_backend
 else:
@@ -17,6 +11,17 @@ else:
 
 _MAX_STEPS = 8
 _device_optin: dict[int, int] = {}
+
+
+def _get_cuda_backend():
+    # Source checkouts retain CUDA files even when the XPU wheel excludes them.
+    # Importing Kitchen on XPU must not register CUDA just because those files
+    # are present beside the installed provider source.
+    try:
+        from .backends import cuda as backend
+    except ImportError:
+        return None
+    return backend
 
 
 def _fused_shmem_bytes(key_head_dim: int, value_head_dim: int) -> int:
@@ -45,7 +50,8 @@ def is_available(device: torch.device | int | None = None, key_head_dim: int = 1
         if device is not None and torch.device(device).type != "cuda":
             return False
         return _hip_backend.gated_delta_decode_is_available(key_head_dim, value_head_dim)
-    ext = _cuda_backend._C if _cuda_backend is not None and _cuda_backend._EXT_AVAILABLE else None
+    cuda_backend = _get_cuda_backend()
+    ext = cuda_backend._C if cuda_backend is not None and cuda_backend._EXT_AVAILABLE else None
     if ext is None or not hasattr(ext, "gated_delta_decode_fused") or not hasattr(ext, "deltanet_conv_step"):
         return False
     if key_head_dim != 128 or value_head_dim % 32 != 0 or not 0 < value_head_dim <= 512:
@@ -109,8 +115,9 @@ def gated_delta_decode_fused(
         if not ok:
             raise RuntimeError("gated_delta_decode_fused launch rejected")
         return out
-    wrap = _cuda_backend._wrap_for_dlpack
-    ok = _cuda_backend._C.gated_delta_decode_fused(
+    cuda_backend = _get_cuda_backend()
+    wrap = cuda_backend._wrap_for_dlpack
+    ok = cuda_backend._C.gated_delta_decode_fused(
         wrap(mixed_qkv.contiguous()), wrap(x.contiguous()), wrap(w_a.contiguous()), wrap(w_b.contiguous()),
         wrap(dt_bias), wrap(g_decay), wrap(state), wrap(out),
         wrap(snapshots) if snapshots is not None else None,
@@ -151,8 +158,9 @@ def deltanet_conv_step(
         if not ok:
             raise RuntimeError("deltanet_conv_step launch rejected")
         return out
-    wrap = _cuda_backend._wrap_for_dlpack
-    ok = _cuda_backend._C.deltanet_conv_step(
+    cuda_backend = _get_cuda_backend()
+    wrap = cuda_backend._wrap_for_dlpack
+    ok = cuda_backend._C.deltanet_conv_step(
         wrap(proj.contiguous()), wrap(conv_state), wrap(conv_w.reshape(channels, -1).contiguous()),
         wrap(conv_b.contiguous()) if conv_b is not None else None, wrap(out),
         wrap(snapshots) if snapshots is not None else None,
