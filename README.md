@@ -106,7 +106,7 @@ means that the requested public path has no working XPU implementation.
 | FP16 linear and Conv3D | Native, numeric gap | Conv3D accepts strided input and `out` views; large-shape paths still accumulate in FP32. |
 | GroupNorm+SiLU+pad3d | Native | Reflect or zero spatial padding, strided input and `out` views. |
 | Gated Delta decode and DeltaNet convolution | Native | Companion decode kernels. |
-| AWQ W4A16 GEMV | Fallback | PyTorch eager; no Kitchen XPU capability. |
+| AWQ W4A16 GEMV/GEMM | Native | FP16/BF16 packed uint4 path; unsupported dtypes still use eager. |
 | NVFP4 and MXFP8 quantize/dequantize/matmul | Fallback | Triton or PyTorch eager where their constraints allow; no Kitchen XPU capability. |
 | W4A8 quantized linear | Deferred | Its XPU native implementation is deferred. |
 
@@ -242,8 +242,8 @@ revision/version and XPU target.
 
 - Intel XPU support remains experimental and is not an upstream Comfy Kitchen
   release claim.
-- NVFP4, MXFP8, and AWQ currently use fallback implementations on XPU and
-  remain native-kernel gaps.
+- NVFP4 and MXFP8 currently use fallback implementations on XPU and remain
+  native-kernel gaps. AWQ dtypes outside the native FP16/BF16 path use eager.
 - The W4A8 decode GEMV optimization is deferred for XPU.
 - Native wheels are CPython-, Torch-ABI-, and target-specific.
 - BMG and PTL-H performance numbers are not portable across devices.

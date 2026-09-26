@@ -63,6 +63,7 @@ __all__ = [
     "fp16_linear",
     "fp16_conv3d",
     "fp16_conv3d_out",
+    "gemv_awq_w4a16",
 ]
 
 _AVAILABLE = False
@@ -86,6 +87,7 @@ _GROUP_NORM_SILU_PAD3D_OUT_AVAILABLE = False
 _FP16_LINEAR_AVAILABLE = False
 _FP16_CONV3D_AVAILABLE = False
 _FP16_CONV3D_OUT_AVAILABLE = False
+_AWQ_W4A16_AVAILABLE = False
 _RMS_NORM_FOR_INT8_AVAILABLE = False
 _RMS_NORM_QUANTIZE_AVAILABLE = False
 _RMS_NORM_CONVROT_QUANT_AVAILABLE = False
@@ -193,6 +195,18 @@ def fp16_conv3d_out(x, weight, bias, residual, stride, out):
         stride, out,
     )
 
+
+def gemv_awq_w4a16(x, qweight, wscales, wzeros, bias=None, group_size=64):
+    from omni_xpu_kernel import kitchen
+
+    compute_dtype = wscales.dtype
+    return kitchen.gemv_awq_w4a16(
+        x.to(compute_dtype), qweight,
+        wscales, wzeros.to(compute_dtype),
+        None if bias is None else bias.to(compute_dtype),
+        group_size,
+    )
+
 _REQUIRED_NATIVE_INT8_OPS = frozenset(
     {
         "dequantize_int8_simple",
@@ -235,6 +249,10 @@ try:
         _FP16_CONV3D_OUT_AVAILABLE = (
             _native_kitchen is not None
             and hasattr(_native_kitchen, "fp16_conv3d_out")
+        )
+        _AWQ_W4A16_AVAILABLE = (
+            _native_kitchen is not None
+            and hasattr(_native_kitchen, "gemv_awq_w4a16")
         )
         _RMS_NORM_FOR_INT8_AVAILABLE = (
             _native_kitchen is not None
@@ -918,6 +936,22 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
             capabilities["fp16_conv3d_out"] = with_out_param(
                 capabilities["fp16_conv3d"]
             )
+    if _AWQ_W4A16_AVAILABLE:
+        low_precision = frozenset({torch.float16, torch.bfloat16})
+        capabilities["gemv_awq_w4a16"] = FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=low_precision),
+                "qweight": int8_2d,
+                "wscales": ParamConstraint(
+                    dtypes=low_precision, shape_rules=(ExactDims(2),),
+                ),
+                "wzeros": ParamConstraint(
+                    dtypes=low_precision, shape_rules=(ExactDims(2),),
+                ),
+                "bias": ParamConstraint(dtypes=low_precision),
+            },
+            default_devices=xpu,
+        )
     if _FP8_QDQ_AVAILABLE:
         fp8_dtypes = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
         capabilities.update(

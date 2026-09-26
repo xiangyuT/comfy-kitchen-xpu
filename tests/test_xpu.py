@@ -169,6 +169,60 @@ def test_xpu_group_norm_out_fullgraph_compile():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("rows,columns,width", [
+    (1, 512, 512), (8, 1024, 1024), (64, 1152, 1152),
+])
+def test_xpu_awq_w4a16_matches_eager(rows, columns, width):
+    torch.manual_seed(20260927)
+    x = torch.randn(rows, width, device="xpu", dtype=torch.bfloat16)
+    packed = torch.randint(
+        0, 256, (columns, width // 2), device="xpu", dtype=torch.uint8,
+    ).view(torch.int8)
+    scales = torch.randn(width // 64, columns, device="xpu", dtype=torch.bfloat16).abs() * 0.01
+    zeros = torch.randn(width // 64, columns, device="xpu", dtype=torch.bfloat16) * 0.01
+    bias = torch.randn(columns, device="xpu", dtype=torch.bfloat16)
+
+    with ck.use_backend("xpu"):
+        actual = ck.gemv_awq_w4a16(x, packed, scales, zeros, bias, 64)
+    with ck.use_backend("eager"):
+        expected = ck.gemv_awq_w4a16(x, packed, scales, zeros, bias, 64)
+    relative = (
+        (actual.float() - expected.float()).norm() /
+        expected.float().norm().clamp_min(1e-9)
+    ).item()
+    assert relative < 1e-2
+    assert "gemv_awq_w4a16" in ck.list_backends()["xpu"]["capabilities"]
+
+
+def test_xpu_awq_w4a16_fullgraph_compile():
+    x = torch.randn(1, 128, device="xpu", dtype=torch.bfloat16)
+    packed = torch.randint(0, 256, (32, 64), device="xpu", dtype=torch.uint8).view(torch.int8)
+    scales = torch.ones(2, 32, device="xpu", dtype=torch.bfloat16) * 0.01
+    zeros = torch.zeros_like(scales)
+
+    def run(inp):
+        return ck.gemv_awq_w4a16(inp, packed, scales, zeros, None, 64)
+
+    with ck.use_backend("xpu"):
+        expected = run(x)
+        actual = torch.compile(run, backend="eager", fullgraph=True)(x)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_xpu_awq_w4a16_3d_input_uses_scale_dtype():
+    x = torch.randn(2, 2, 128, device="xpu", dtype=torch.float16)
+    packed = torch.randint(0, 256, (32, 64), device="xpu", dtype=torch.uint8).view(torch.int8)
+    scales = torch.ones(2, 32, device="xpu", dtype=torch.bfloat16) * 0.01
+    zeros = torch.zeros_like(scales)
+    with ck.use_backend("xpu"):
+        actual = ck.gemv_awq_w4a16(x, packed, scales, zeros, None, 64)
+    with ck.use_backend("eager"):
+        expected = ck.gemv_awq_w4a16(x, packed, scales, zeros, None, 64)
+    assert actual.shape == (2, 2, 32)
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=1e-2, atol=1e-2)
+
+
 def test_xpu_fp16_linear_uses_native_route():
     x = torch.randn(8, 128, device="xpu", dtype=torch.float16)
     weight = torch.randn(64, 128, device="xpu", dtype=torch.float16)
