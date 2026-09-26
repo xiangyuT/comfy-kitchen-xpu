@@ -82,7 +82,9 @@ _GROUP_NORM_SILU_PAD3D_AVAILABLE = False
 _FP16_LINEAR_AVAILABLE = False
 _FP16_CONV3D_AVAILABLE = False
 _RMS_NORM_FOR_INT8_AVAILABLE = False
+_RMS_NORM_QUANTIZE_AVAILABLE = False
 _SCALED_RESIDUAL_AVAILABLE = False
+_FUSED_RESIDUAL_AVAILABLE = False
 
 
 def gated_delta_decode_is_available(
@@ -193,11 +195,19 @@ try:
             _native_kitchen is not None
             and hasattr(_native_kitchen, "rms_norm_for_int8")
         )
+        _RMS_NORM_QUANTIZE_AVAILABLE = (
+            _native_kitchen is not None
+            and hasattr(_native_kitchen, "rms_norm_quantize_int8")
+        )
         _SCALED_RESIDUAL_AVAILABLE = (
             _native_kitchen is not None
             and hasattr(_native_kitchen, "scaled_residual")
         )
         _native_int8 = getattr(_extension, "int8", None)
+        _FUSED_RESIDUAL_AVAILABLE = (
+            _native_int8 is not None
+            and hasattr(_native_int8, "int8_linear_prequantized_residual")
+        )
         _NATIVE_CAPABILITIES = frozenset(
             name
             for name in _REQUIRED_NATIVE_INT8_OPS
@@ -357,6 +367,66 @@ if _AVAILABLE:
                 dtype=_INT8_LINEAR_DTYPES[output_dtype_code],
             )
 
+        @torch.library.custom_op(
+            "comfy_kitchen_xpu::int8_linear_residual",
+            mutates_args=(),
+        )
+        def _compiled_int8_linear_residual(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            weight_scale: torch.Tensor,
+            bias: torch.Tensor | None,
+            output_dtype_code: int,
+            residual: torch.Tensor,
+            residual_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            x_int8, x_scale = _int8.quantize_int8_rowwise(x)
+            return _native_int8.int8_linear_prequantized_residual(
+                x_int8, x_scale, weight, weight_scale, bias,
+                output_dtype_code, residual, residual_scale,
+            )
+
+        @_compiled_int8_linear_residual.register_fake
+        def _compiled_int8_linear_residual_fake(
+            x, weight, weight_scale, bias, output_dtype_code,
+            residual, residual_scale,
+        ):
+            del weight_scale, bias, residual, residual_scale
+            return x.new_empty(
+                (*x.shape[:-1], weight.shape[0]),
+                dtype=_INT8_LINEAR_DTYPES[output_dtype_code],
+            )
+
+        @torch.library.custom_op(
+            "comfy_kitchen_xpu::int8_linear_prequantized_residual",
+            mutates_args=(),
+        )
+        def _compiled_int8_linear_prequantized_residual(
+            x_int8: torch.Tensor,
+            x_scale: torch.Tensor,
+            weight: torch.Tensor,
+            weight_scale: torch.Tensor,
+            bias: torch.Tensor | None,
+            output_dtype_code: int,
+            residual: torch.Tensor,
+            residual_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            return _native_int8.int8_linear_prequantized_residual(
+                x_int8, x_scale, weight, weight_scale, bias,
+                output_dtype_code, residual, residual_scale,
+            )
+
+        @_compiled_int8_linear_prequantized_residual.register_fake
+        def _compiled_int8_linear_prequantized_residual_fake(
+            x_int8, x_scale, weight, weight_scale, bias,
+            output_dtype_code, residual, residual_scale,
+        ):
+            del x_scale, weight_scale, bias, residual, residual_scale
+            return x_int8.new_empty(
+                (*x_int8.shape[:-1], weight.shape[0]),
+                dtype=_INT8_LINEAR_DTYPES[output_dtype_code],
+            )
+
         def int8_linear(
             x: torch.Tensor,
             weight: torch.Tensor,
@@ -371,6 +441,7 @@ if _AVAILABLE:
             residual: torch.Tensor | None = None,
             residual_scale: torch.Tensor | None = None,
         ) -> torch.Tensor:
+            prepared = None
             if input_act == "rms_norm":
                 if input_act_weight is None:
                     raise ValueError("input_act 'rms_norm' requires input_act_weight")
@@ -379,10 +450,75 @@ if _AVAILABLE:
                 norm_weight = input_act_weight.to(x.dtype).contiguous()
                 from omni_xpu_kernel import kitchen
 
-                x = kitchen.rms_norm_for_int8(
-                    x, norm_weight, input_act_eps,
-                )
+                if _RMS_NORM_QUANTIZE_AVAILABLE and not convrot:
+                    prepared = kitchen.rms_norm_quantize_int8(
+                        x, norm_weight, input_act_eps,
+                    )
+                else:
+                    x = kitchen.rms_norm_for_int8(
+                        x, norm_weight, input_act_eps,
+                    )
                 input_act = None
+            if prepared is not None:
+                actual_dtype = x.dtype if out_dtype is None else out_dtype
+                output_dtype_code = {
+                    torch.float32: 0,
+                    torch.float16: 1,
+                    torch.bfloat16: 2,
+                }.get(actual_dtype, 2)
+                if (
+                    residual is not None
+                    and residual_scale is not None
+                    and _FUSED_RESIDUAL_AVAILABLE
+                ):
+                    add = residual.to(actual_dtype).contiguous()
+                    add_scale = residual_scale.to(actual_dtype).contiguous()
+                    if torch.compiler.is_compiling():
+                        return _compiled_int8_linear_prequantized_residual(
+                            *prepared, weight, weight_scale, bias,
+                            output_dtype_code, add, add_scale,
+                        )
+                    return _native_int8.int8_linear_prequantized_residual(
+                        *prepared, weight, weight_scale, bias,
+                        output_dtype_code, add, add_scale,
+                    )
+                out = _int8.int8_linear_prequantized(
+                    *prepared, weight, weight_scale, bias, actual_dtype,
+                )
+                if residual is None:
+                    return out
+                if residual_scale is None:
+                    raise ValueError("residual requires residual_scale")
+                if not _SCALED_RESIDUAL_AVAILABLE:
+                    raise RuntimeError("Omni XPU scaled residual is unavailable")
+                add = residual.to(actual_dtype).contiguous()
+                add_scale = residual_scale.to(actual_dtype).contiguous()
+                return kitchen.scaled_residual(out, add, add_scale)
+            if (
+                residual is not None
+                and residual_scale is not None
+                and _FUSED_RESIDUAL_AVAILABLE
+                and not convrot
+                and input_act in (None, "none")
+            ):
+                actual_dtype = x.dtype if out_dtype is None else out_dtype
+                output_dtype_code = {
+                    torch.float32: 0,
+                    torch.float16: 1,
+                    torch.bfloat16: 2,
+                }.get(actual_dtype, 2)
+                add = residual.to(actual_dtype).contiguous()
+                add_scale = residual_scale.to(actual_dtype).contiguous()
+                if torch.compiler.is_compiling():
+                    return _compiled_int8_linear_residual(
+                        x, weight, weight_scale, bias, output_dtype_code,
+                        add, add_scale,
+                    )
+                x_int8, x_scale = _int8.quantize_int8_rowwise(x)
+                return _native_int8.int8_linear_prequantized_residual(
+                    x_int8, x_scale, weight, weight_scale, bias,
+                    output_dtype_code, add, add_scale,
+                )
             if not torch.compiler.is_compiling():
                 out = _int8.int8_linear(
                     x,

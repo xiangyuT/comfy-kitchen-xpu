@@ -13,6 +13,7 @@ import pytest
 import torch
 
 import comfy_kitchen as ck
+from tests.conftest import rel_err
 
 
 def _xpu_available() -> bool:
@@ -496,6 +497,23 @@ def test_xpu_int8_linear_two_row_ar_cfg_matches_eager(dtype):
     assert error.max().item() < 0.75
 
 
+def test_xpu_int8_two_row_residual_matches_composed_route():
+    x = torch.randn(2, 256, device="xpu", dtype=torch.bfloat16)
+    weight = torch.randn(96, 256, device="xpu", dtype=torch.bfloat16)
+    bias = torch.randn(96, device="xpu", dtype=torch.bfloat16)
+    residual = torch.randn(2, 96, device="xpu", dtype=torch.bfloat16)
+    residual_scale = torch.randn(96, device="xpu", dtype=torch.bfloat16)
+    with ck.use_backend("xpu"):
+        qweight, scale = ck.quantize_int8_tensorwise(weight)
+        actual = ck.int8_linear(
+            x, qweight, scale, bias, torch.bfloat16,
+            residual=residual, residual_scale=residual_scale,
+        )
+        linear = ck.int8_linear(x, qweight, scale, bias, torch.bfloat16)
+    expected = torch.addcmul(residual, linear, residual_scale)
+    torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.03)
+
+
 def test_xpu_int8_linear_swiglu_input_act():
     rows, hidden, output = 37, 256, 96
     x = torch.randn(rows, 2 * hidden, device="xpu", dtype=torch.bfloat16)
@@ -707,7 +725,9 @@ def test_xpu_int8_linear_rms_norm_and_residual_match_composed_route():
         )
         linear = ck.int8_linear(normalized, qweight, weight_scale, out_dtype=torch.bfloat16)
     expected = torch.addcmul(residual, linear, residual_scale)
-    torch.testing.assert_close(actual, expected)
+    # Match the CUDA fused-epilogue contract: its final FP32 addcmul can
+    # differ by rounding from a separately materialized BF16 projection.
+    assert rel_err(actual, expected) < 1e-2
 
 
 def test_xpu_int8_linear_rms_norm_and_residual_compile():
