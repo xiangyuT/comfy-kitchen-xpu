@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 
+from .backends import xpu as _xpu_backend
+
 try:
     from .backends import cuda as _cuda_backend
 except ImportError:
@@ -25,6 +27,12 @@ def _fused_shmem_bytes(key_head_dim: int, value_head_dim: int) -> int:
 
 def is_available(device: torch.device | int | None = None, key_head_dim: int = 128, value_head_dim: int = 128) -> bool:
     """Return whether the fused DeltaNet decode kernels can run on this device for these head dims."""
+    if isinstance(device, int) and not torch.cuda.is_available() and hasattr(torch, "xpu") and torch.xpu.is_available():
+        return 0 <= device < torch.xpu.device_count() and _xpu_backend.gated_delta_decode_is_available(key_head_dim, value_head_dim)
+    if device is not None and not isinstance(device, int) and torch.device(device).type == "xpu":
+        return _xpu_backend.gated_delta_decode_is_available(key_head_dim, value_head_dim)
+    if device is None and not torch.cuda.is_available() and hasattr(torch, "xpu") and torch.xpu.is_available():
+        return _xpu_backend.gated_delta_decode_is_available(key_head_dim, value_head_dim)
     if not torch.cuda.is_available():
         return False
     if _hip_backend is not None:
@@ -85,6 +93,11 @@ def gated_delta_decode_fused(
     heads, key_dim_head, value_dim = state.shape[1], state.shape[2], state.shape[3]
     if not is_available(x.device, key_dim_head, value_dim):
         raise RuntimeError("gated_delta_decode_fused is unavailable for this device and head shape")
+    if x.device.type == "xpu":
+        return _xpu_backend.gated_delta_decode_fused(
+            mixed_qkv, x, w_a, w_b, dt_bias, g_decay, state,
+            key_dim, num_key_heads, scale, z, norm_weight, eps, snapshots,
+        )
     out = torch.empty((batch, seq, heads, value_dim), dtype=x.dtype, device=x.device)
     if _hip_backend is not None:
         ok = _hip_backend.gated_delta_decode_fused(
@@ -123,7 +136,11 @@ def deltanet_conv_step(
     must be contiguous.
     """
     if not is_available(proj.device):
-        raise RuntimeError("deltanet_conv_step requires the CUDA or HIP extension")
+        raise RuntimeError("deltanet_conv_step requires an available CUDA, HIP, or XPU extension")
+    if proj.device.type == "xpu":
+        return _xpu_backend.deltanet_conv_step(
+            proj, conv_state, conv_w, conv_b, snapshots,
+        )
     batch, seq, channels = proj.shape
     out = torch.empty((batch, channels, seq), dtype=proj.dtype, device=proj.device)
     if _hip_backend is not None:

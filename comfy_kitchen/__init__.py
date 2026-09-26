@@ -1011,7 +1011,9 @@ def fp16_linear(
     Same numerics as ``torch.backends.cuda.matmul.allow_fp16_accumulation``, so
     route here only when the user opted into that mode.
     """
-    if not _fp16_linear_fills_gpu(x.shape[:-1].numel(), weight.shape[0], weight.shape[1]):
+    if x.device.type == "cuda" and not _fp16_linear_fills_gpu(
+        x.shape[:-1].numel(), weight.shape[0], weight.shape[1]
+    ):
         # cuBLAS (already fp16-accumulate when the caller opted in) wins outright
         # below these sizes, and the dispatch alone would cost more than the call
         out = torch.nn.functional.linear(x, weight, bias)

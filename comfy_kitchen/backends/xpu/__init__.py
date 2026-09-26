@@ -6,8 +6,6 @@ import sys
 
 import torch
 
-from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
-from comfy_kitchen.backends._activations import apply_residual as _apply_residual
 from comfy_kitchen.constraints import (
     ExactDims, FunctionConstraints, ParamConstraint, sol_attn_common_call_rule,
 )
@@ -55,6 +53,12 @@ __all__ = [
     "scaled_mm_svdquant_w4a4",
     "svdquant_w4a16_linear",
     "stochastic_rounding_fp8",
+    "gated_delta_decode_is_available",
+    "gated_delta_decode_fused",
+    "deltanet_conv_step",
+    "group_norm_silu_pad3d",
+    "fp16_linear",
+    "fp16_conv3d",
 ]
 
 _AVAILABLE = False
@@ -73,6 +77,81 @@ _CONVROT_NATIVE_AVAILABLE = False
 _GGUF_AVAILABLE = False
 _SOL_AVAILABLE = False
 _SOL_ERROR = None
+_GROUP_NORM_SILU_PAD3D_AVAILABLE = False
+_FP16_LINEAR_AVAILABLE = False
+_FP16_CONV3D_AVAILABLE = False
+_RMS_NORM_FOR_INT8_AVAILABLE = False
+_SCALED_RESIDUAL_AVAILABLE = False
+
+
+def gated_delta_decode_is_available(
+    key_head_dim: int = 128, value_head_dim: int = 128,
+) -> bool:
+    if not _AVAILABLE or key_head_dim != 128 or value_head_dim % 32 != 0 or not 0 < value_head_dim <= 512:
+        return False
+    try:
+        from omni_xpu_kernel import kitchen
+    except ImportError:
+        return False
+    return (
+        kitchen.supports_deltanet_conv_step()
+        and kitchen.supports_gated_delta_decode_fused()
+    )
+
+
+def deltanet_conv_step(proj, conv_state, conv_w, conv_b=None, snapshots=None):
+    from omni_xpu_kernel import kitchen
+
+    return kitchen.deltanet_conv_step(
+        proj, conv_state, conv_w, conv_b, snapshots,
+    )
+
+
+def gated_delta_decode_fused(
+    mixed_qkv, x, w_a, w_b, dt_bias, g_decay, state,
+    key_dim, num_key_heads, scale, z, norm_weight, eps, snapshots=None,
+):
+    from omni_xpu_kernel import kitchen
+
+    return kitchen.gated_delta_decode_fused(
+        mixed_qkv, x, w_a, w_b, dt_bias, g_decay, state,
+        key_dim, num_key_heads, scale, z, norm_weight, eps, snapshots,
+    )
+
+
+def group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu):
+    from omni_xpu_kernel import kitchen
+
+    if min(pad) < 0:
+        raise ValueError("group_norm_silu_pad3d: padding must be non-negative")
+    return kitchen.group_norm_silu_pad3d(
+        x,
+        None if weight is None else weight.to(x.dtype),
+        None if bias is None else bias.to(x.dtype),
+        num_groups, eps, tuple(pad), silu,
+    )
+
+
+def fp16_linear(x, weight, bias=None, residual=None, residual_scale=None):
+    from omni_xpu_kernel import kitchen
+
+    return kitchen.fp16_linear(
+        x, weight,
+        None if bias is None else bias.to(x.dtype),
+        None if residual is None else residual.to(x.dtype),
+        None if residual_scale is None else residual_scale.to(x.dtype),
+    )
+
+
+def fp16_conv3d(x, weight, bias=None, residual=None, stride=None):
+    from omni_xpu_kernel import kitchen
+
+    return kitchen.fp16_conv3d(
+        x, weight,
+        None if bias is None else bias.to(x.dtype),
+        None if residual is None else residual.to(x.dtype),
+        tuple((1, 1, 1) if stride is None else stride),
+    )
 
 _REQUIRED_NATIVE_INT8_OPS = frozenset(
     {
@@ -96,6 +175,27 @@ try:
     else:
         _extension = omni_xpu_kernel._load_extension()
         _AVAILABLE = True
+        _native_kitchen = getattr(_extension, "kitchen", None)
+        _GROUP_NORM_SILU_PAD3D_AVAILABLE = (
+            _native_kitchen is not None
+            and hasattr(_native_kitchen, "group_norm_silu_pad3d")
+        )
+        _FP16_LINEAR_AVAILABLE = (
+            _native_kitchen is not None
+            and hasattr(_native_kitchen, "fp16_linear")
+        )
+        _FP16_CONV3D_AVAILABLE = (
+            _native_kitchen is not None
+            and hasattr(_native_kitchen, "fp16_conv3d")
+        )
+        _RMS_NORM_FOR_INT8_AVAILABLE = (
+            _native_kitchen is not None
+            and hasattr(_native_kitchen, "rms_norm_for_int8")
+        )
+        _SCALED_RESIDUAL_AVAILABLE = (
+            _native_kitchen is not None
+            and hasattr(_native_kitchen, "scaled_residual")
+        )
         _native_int8 = getattr(_extension, "int8", None)
         _NATIVE_CAPABILITIES = frozenset(
             name
@@ -269,7 +369,16 @@ if _AVAILABLE:
             residual_scale: torch.Tensor | None = None,
         ) -> torch.Tensor:
             if input_act == "rms_norm":
-                x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+                if input_act_weight is None:
+                    raise ValueError("input_act 'rms_norm' requires input_act_weight")
+                if not _RMS_NORM_FOR_INT8_AVAILABLE:
+                    raise RuntimeError("Omni XPU RMSNorm for INT8 is unavailable")
+                norm_weight = input_act_weight.to(x.dtype).contiguous()
+                from omni_xpu_kernel import kitchen
+
+                x = kitchen.rms_norm_for_int8(
+                    x, norm_weight, input_act_eps,
+                )
                 input_act = None
             if not torch.compiler.is_compiling():
                 out = _int8.int8_linear(
@@ -303,7 +412,19 @@ if _AVAILABLE:
                     convrot_groupsize,
                     input_act_code,
                 )
-            return _apply_residual(out, residual, residual_scale)
+            if residual is None:
+                return out
+            if residual_scale is None:
+                raise ValueError("residual requires residual_scale")
+            if not _SCALED_RESIDUAL_AVAILABLE:
+                raise RuntimeError("Omni XPU scaled residual is unavailable")
+            add = residual.to(out.dtype).contiguous()
+            add_scale = residual_scale.to(out.dtype).contiguous()
+            from omni_xpu_kernel import kitchen
+
+            return kitchen.scaled_residual(
+                out, add, add_scale,
+            )
 
     if _NORM_AVAILABLE:
         from .adaln import adaln, rms_adaln
@@ -560,6 +681,36 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
                 },
                 default_devices=xpu,
             )
+    if _GROUP_NORM_SILU_PAD3D_AVAILABLE:
+        capabilities["group_norm_silu_pad3d"] = FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(5),)),
+                "weight": ParamConstraint(dtypes=floats),
+                "bias": ParamConstraint(dtypes=floats),
+            },
+            default_devices=xpu,
+        )
+    if _FP16_LINEAR_AVAILABLE:
+        capabilities["fp16_linear"] = FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=frozenset({torch.float16})),
+                "weight": ParamConstraint(dtypes=frozenset({torch.float16})),
+                "bias": ParamConstraint(dtypes=floats),
+                "residual": ParamConstraint(dtypes=floats),
+                "residual_scale": ParamConstraint(dtypes=floats),
+            },
+            default_devices=xpu,
+        )
+    if _FP16_CONV3D_AVAILABLE:
+        capabilities["fp16_conv3d"] = FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(5),)),
+                "weight": ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(5),)),
+                "bias": ParamConstraint(dtypes=floats),
+                "residual": ParamConstraint(dtypes=floats),
+            },
+            default_devices=xpu,
+        )
     if _FP8_QDQ_AVAILABLE:
         fp8_dtypes = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
         capabilities.update(

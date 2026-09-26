@@ -70,6 +70,9 @@ The original upstream CUDA and generic-backend README is retained
   RoPE, fused RMSNorm+RoPE (including partial split-half in-place views), AdaLN,
   RMS-AdaLN, fused SwiGLU+INT8 input quantization, ConvRot W4A4, FP8 W8A16,
   managed GGUF dequantization, and Nunchaku-compatible SVDQuant W4A16 dispatch.
+- Native XPU routes for Gated Delta decode, causal DeltaNet convolution,
+  per-frame GroupNorm with SiLU and padding, FP16 linear and Conv3D, and the
+  RMSNorm and scaled-residual stages of INT8 linear.
 - XPU-aware QuantizedTensor lifecycle, device migration, `linear`, `mm`,
   `addmm`, transpose, serialization, and prepared-weight paths.
 - Target-checked companion-wheel construction for BMG and PTL-H, including
@@ -95,8 +98,9 @@ The XPU backend becomes available only when:
 2. `omni_xpu_kernel` and its native extension load;
 3. the required native INT8 symbols are present.
 
-Optional SVDQuant W4A4/W4A16, normalization, FP8, RoPE, ConvRot, and GGUF
-capability groups are detected separately. A partial or older native package
+Optional SVDQuant W4A4/W4A16, normalization, FP8, RoPE, ConvRot, GGUF, and
+new Kitchen operator capability groups are detected separately. A partial or
+older native package
 therefore advertises only the operations it actually implements. Triton
 remains available on non-Windows XPU stacks that support it, with eager
 implementations as the portable fallback.
@@ -149,7 +153,7 @@ git clone https://github.com/xiangyuT/comfy-kitchen-xpu.git
 cd comfy-kitchen-xpu
 python -m pip install build
 python -m build --wheel
-pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.31-py3-none-any.whl
+pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.35-py3-none-any.whl
 ```
 
 The repository retains upstream CUDA source to keep future upstream updates
@@ -206,6 +210,7 @@ revision/version and XPU target.
 - Intel XPU support remains experimental and is not an upstream Comfy Kitchen
   release claim.
 - NVFP4, MXFP8, and AWQ are explicitly deferred for XPU.
+- The W4A8 decode GEMV optimization is deferred for XPU.
 - Native wheels are CPython-, Torch-ABI-, and target-specific.
 - BMG and PTL-H performance numbers are not portable across devices.
 - Full-image measurements include changes outside Kitchen and cannot establish

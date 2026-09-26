@@ -25,45 +25,52 @@ pytestmark = [
 ]
 
 
-def test_xpu_fp16_conv3d_uses_torch_fallback():
+def test_xpu_fp16_conv3d_uses_native_route():
     x = torch.randn(1, 4, 4, 5, 5, device="xpu", dtype=torch.float16)
     weight = torch.randn(8, 4, 2, 2, 2, device="xpu", dtype=torch.float16)
     bias = torch.randn(8, device="xpu", dtype=torch.float16)
     residual = torch.randn(1, 8, 3, 4, 4, device="xpu", dtype=torch.float16)
 
-    actual = ck.fp16_conv3d(x, weight, bias, residual)
+    with ck.use_backend("xpu"):
+        actual = ck.fp16_conv3d(x, weight, bias, residual)
     expected = torch.nn.functional.conv3d(x, weight, bias) + residual
-    torch.testing.assert_close(actual, expected)
-    assert "fp16_conv3d" not in ck.list_backends()["xpu"]["capabilities"]
+    from tests.conftest import fp16_accum_tol, rel_err
+
+    assert rel_err(actual.float(), expected.float()) < fp16_accum_tol(4 * 2 * 2 * 2)
+    assert "fp16_conv3d" in ck.list_backends()["xpu"]["capabilities"]
 
 
-def test_xpu_group_norm_silu_pad3d_uses_torch_fallback():
+def test_xpu_group_norm_silu_pad3d_uses_native_route():
     x = torch.randn(1, 32, 2, 4, 4, device="xpu", dtype=torch.float32)
     weight = torch.randn(32, device="xpu", dtype=torch.float32)
     bias = torch.randn(32, device="xpu", dtype=torch.float32)
 
-    actual = ck.group_norm_silu_pad3d(
-        x, weight, bias, num_groups=8, pad=(1, 1, 1, 1, 1),
-    )
+    with ck.use_backend("xpu"):
+        actual = ck.group_norm_silu_pad3d(
+            x, weight, bias, num_groups=8, pad=(1, 1, 1, 1, 1),
+        )
     frames = x.permute(0, 2, 1, 3, 4).reshape(2, 32, 4, 4)
     normalized = torch.nn.functional.group_norm(frames, 8, weight, bias, 1e-6)
     expected = normalized.reshape(1, 2, 32, 4, 4).permute(0, 2, 1, 3, 4)
     expected = torch.nn.functional.pad(torch.nn.functional.silu(expected), (1, 1, 1, 1, 0, 0), mode="reflect")
     expected = torch.nn.functional.pad(expected, (0, 0, 0, 0, 1, 0))
     torch.testing.assert_close(actual, expected)
-    assert "group_norm_silu_pad3d" not in ck.list_backends()["xpu"]["capabilities"]
+    assert "group_norm_silu_pad3d" in ck.list_backends()["xpu"]["capabilities"]
 
 
-def test_xpu_fp16_linear_uses_torch_fallback():
+def test_xpu_fp16_linear_uses_native_route():
     x = torch.randn(8, 128, device="xpu", dtype=torch.float16)
     weight = torch.randn(64, 128, device="xpu", dtype=torch.float16)
     residual = torch.randn(8, 64, device="xpu", dtype=torch.float16)
     residual_scale = torch.randn(64, device="xpu", dtype=torch.float16)
 
-    actual = ck.fp16_linear(x, weight, residual=residual, residual_scale=residual_scale)
+    with ck.use_backend("xpu"):
+        actual = ck.fp16_linear(x, weight, residual=residual, residual_scale=residual_scale)
     expected = torch.addcmul(residual, torch.nn.functional.linear(x, weight), residual_scale)
-    torch.testing.assert_close(actual, expected)
-    assert "fp16_linear" not in ck.list_backends()["xpu"]["capabilities"]
+    from tests.conftest import fp16_accum_tol, rel_err
+
+    assert rel_err(actual.float(), expected.float()) < fp16_accum_tol(128)
+    assert "fp16_linear" in ck.list_backends()["xpu"]["capabilities"]
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
