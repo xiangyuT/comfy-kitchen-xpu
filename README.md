@@ -85,30 +85,68 @@ available in the installed companion wheel.
 
 ## XPU support matrix
 
-This matrix describes the fork's upstream `0.2.35` API at `b2a2972` and the
-matching `omni_xpu_kernel` companion package. **Native** means that Kitchen
-registers an XPU backend capability; it does not imply that every dtype, shape,
-or layout takes that path. **Fallback** means that dispatch uses Triton or
-PyTorch eager code on XPU, so it is still an XPU native-kernel gap. **Missing**
-means that the requested public path has no working XPU implementation.
+This matrix follows the [upstream per-function format](https://github.com/Comfy-Org/comfy-kitchen#backend-capabilities-matrix)
+for the fork's `0.2.35` API and matching `omni_xpu_kernel` companion package.
+✓ means the fork has a native XPU route when the matching companion symbol is
+present; an empty cell means it does not. Triton or PyTorch eager fallbacks do
+not count as XPU backend support. A ✓ may still have dtype, shape, layout, or
+numeric limits.
 
-| Public operation | XPU status | Scope |
-| --- | --- | --- |
-| FP8 per-tensor quantize/dequantize and stochastic rounding | Native | Companion FP8 kernels. |
-| AdaLN and RMS-AdaLN | Native | Companion norm kernels. |
-| `na2d`, `na3d` | Fallback | Triton or PyTorch eager; no Kitchen XPU capability. |
-| `sol_attn` | Native | Supported BF16/FP16 shapes only. |
-| `int8_attention`, prequantized INT8 attention, Flash decode | Missing | The public attention modules still require CUDA or HIP. |
-| All eight RoPE forms and their in-place forms | Native | Includes RMS-RoPE and split-half layouts. |
-| INT8 rowwise/tensorwise quantize and simple dequantize | Native | Includes output-dtype dequantize. |
-| INT8 ConvRot quantize/dequantize and `int8_linear` | Native | RMSNorm, ConvRot and residual routes use companion kernels when available. |
-| SVDQuant W4A4 and ConvRot W4A4 | Native | Companion INT4 and INT8 kernels. |
-| FP16 linear and Conv3D | Native, numeric gap | Conv3D accepts strided input and `out` views; large-shape paths still accumulate in FP32. |
-| GroupNorm+SiLU+pad3d | Native | Reflect or zero spatial padding, strided input and `out` views. |
-| Gated Delta decode and DeltaNet convolution | Native | Companion decode kernels. |
-| AWQ W4A16 GEMV/GEMM | Native | FP16/BF16 packed uint4 path; unsupported dtypes still use eager. |
-| NVFP4 and MXFP8 quantize/dequantize/matmul | Fallback | Triton or PyTorch eager where their constraints allow; no Kitchen XPU capability. |
-| W4A8 quantized linear | Deferred | Its XPU native implementation is deferred. |
+| Function | xpu |
+| --- | --- |
+| `quantize_per_tensor_fp8` | ✓ |
+| `dequantize_per_tensor_fp8` | ✓ |
+| `stochastic_rounding_fp8` | ✓ |
+| `quantize_nvfp4` | |
+| `dequantize_nvfp4` | |
+| `scaled_mm_nvfp4` | |
+| `quantize_mxfp8` | |
+| `dequantize_mxfp8` | |
+| `scaled_mm_mxfp8` | |
+| `adaln` | ✓ |
+| `rms_adaln` | ✓ |
+| `na3d` | |
+| `na2d` | |
+| `sol_attn` | ✓ |
+| `int8_attention` | |
+| `apply_rope` | ✓ |
+| `apply_rope1` | ✓ |
+| `apply_rope_split_half` | ✓ |
+| `apply_rope_split_half1` | ✓ |
+| `rms_rope` | ✓ |
+| `rms_rope1` | ✓ |
+| `rms_rope_split_half` | ✓ |
+| `rms_rope_split_half1` | ✓ |
+| `quantize_int8_rowwise` | ✓ |
+| `quantize_int8_tensorwise` | ✓ |
+| `quantize_and_rotate_rowwise` | ✓ |
+| `quantize_int8_convrot_weight` | ✓ |
+| `dequantize_int8_simple` | ✓ |
+| `dequantize_int8_simple_dtype` | ✓ |
+| `dequantize_int8_convrot_weight_dtype` | ✓ |
+| `int8_linear` | ✓ |
+| `gemv_awq_w4a16` | ✓ |
+| `quantize_svdquant_w4a4` | ✓ |
+| `scaled_mm_svdquant_w4a4` | ✓ |
+| `convrot_w4a4_linear` | ✓ |
+| `quantize_convrot_w4a4_weight` | ✓ |
+| `dequantize_convrot_w4a4_weight` | ✓ |
+| `fp16_linear` | ✓ |
+| `fp16_conv3d` | ✓ |
+| `group_norm_silu_pad3d` | ✓ |
+| `gated_delta_decode_fused` | ✓ |
+| `deltanet_conv_step` | ✓ |
+| `sol_attn_chunked` | ✓ |
+| `svdquant_w4a16_linear` | ✓ |
+| `dequantize_gguf` | ✓ |
+| `prequantize_int8_attention` | |
+| `int8_attention_from_prequantized` | |
+| `flash_attention_decode` | |
+| `quantize_w4a8_int8_weight` | |
+| `dequantize_w4a8_int8_weight` | |
+| `w4a8_int8_linear` | |
+
+The eight RoPE functions also have in-place forms with the same XPU coverage.
 
 Upstream `main` has additional changes after this fork's source base. The
 `zero_pad`/`out`/strided-view forms for Conv3D and GroupNorm are selectively
