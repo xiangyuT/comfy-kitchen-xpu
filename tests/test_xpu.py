@@ -13,6 +13,7 @@ import pytest
 import torch
 
 import comfy_kitchen as ck
+from tests.conftest import rel_err
 
 
 def _xpu_available() -> bool:
@@ -23,6 +24,218 @@ pytestmark = [
     pytest.mark.xpu,
     pytest.mark.skipif(not _xpu_available(), reason="omni XPU backend is unavailable"),
 ]
+
+
+def test_xpu_fp16_conv3d_uses_native_route():
+    x = torch.randn(1, 4, 4, 5, 5, device="xpu", dtype=torch.float16)
+    weight = torch.randn(8, 4, 2, 2, 2, device="xpu", dtype=torch.float16)
+    bias = torch.randn(8, device="xpu", dtype=torch.float16)
+    residual = torch.randn(1, 8, 3, 4, 4, device="xpu", dtype=torch.float16)
+
+    with ck.use_backend("xpu"):
+        actual = ck.fp16_conv3d(x, weight, bias, residual)
+    expected = torch.nn.functional.conv3d(x, weight, bias) + residual
+    from tests.conftest import fp16_accum_tol, rel_err
+
+    assert rel_err(actual.float(), expected.float()) < fp16_accum_tol(4 * 2 * 2 * 2)
+    assert "fp16_conv3d" in ck.list_backends()["xpu"]["capabilities"]
+
+
+def test_xpu_fp16_conv3d_strided_input_writes_frame_view():
+    torch.manual_seed(20260927)
+    base = torch.randn(1, 64, 4, 20, 20, device="xpu", dtype=torch.float16)
+    x = base[:, :, :, 1:19, 1:19]
+    weight = torch.randn(64, 64, 3, 3, 3, device="xpu", dtype=torch.float16) * 0.02
+    bias = torch.randn(64, device="xpu", dtype=torch.float16)
+    full = torch.full(
+        (1, 64, 4, 16, 16), 7.0, device="xpu", dtype=torch.float16,
+    ).contiguous(memory_format=torch.channels_last_3d)
+    out = full[:, :, 1:3]
+    with ck.use_backend("xpu"):
+        actual = ck.fp16_conv3d(x, weight, bias, out=out)
+    expected = torch.nn.functional.conv3d(x, weight, bias)
+    from tests.conftest import fp16_accum_tol, rel_err
+
+    assert actual.data_ptr() == out.data_ptr()
+    assert rel_err(actual.float(), expected.float()) < fp16_accum_tol(64 * 27)
+    assert bool((full[:, :, 0] == 7).all())
+    assert bool((full[:, :, 3] == 7).all())
+    assert "fp16_conv3d_out" in ck.list_backends()["xpu"]["capabilities"]
+
+
+def test_xpu_fp16_conv3d_two_batch_out_view_preserves_other_frames():
+    x = torch.randn(2, 4, 3, 5, 5, device="xpu", dtype=torch.float16)
+    weight = torch.randn(6, 4, 2, 3, 3, device="xpu", dtype=torch.float16)
+    full = torch.full(
+        (2, 6, 4, 3, 3), 7.0, device="xpu", dtype=torch.float16,
+    ).contiguous(memory_format=torch.channels_last_3d)
+    out = full[:, :, 1:3]
+    with ck.use_backend("xpu"):
+        ck.fp16_conv3d(x, weight, out=out)
+    expected = torch.nn.functional.conv3d(x, weight)
+    from tests.conftest import fp16_accum_tol, rel_err
+
+    assert rel_err(out.float(), expected.float()) < fp16_accum_tol(4 * 2 * 3 * 3)
+    assert bool((full[:, :, 0] == 7).all())
+    assert bool((full[:, :, 3] == 7).all())
+
+
+def test_xpu_fp16_conv3d_out_fullgraph_compile():
+    x = torch.randn(1, 4, 3, 5, 5, device="xpu", dtype=torch.float16)
+    weight = torch.randn(6, 4, 2, 3, 3, device="xpu", dtype=torch.float16)
+    eager_out = torch.empty(1, 6, 2, 3, 3, device="xpu", dtype=torch.float16)
+    compiled_out = torch.empty_like(eager_out)
+
+    def run(inp, dst):
+        return ck.fp16_conv3d(inp, weight, out=dst)
+
+    with ck.use_backend("xpu"):
+        expected = run(x, eager_out)
+        actual = torch.compile(run, backend="eager", fullgraph=True)(
+            x, compiled_out,
+        )
+    assert actual.data_ptr() == compiled_out.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_xpu_group_norm_silu_pad3d_uses_native_route():
+    x = torch.randn(1, 32, 2, 4, 4, device="xpu", dtype=torch.float32)
+    weight = torch.randn(32, device="xpu", dtype=torch.float32)
+    bias = torch.randn(32, device="xpu", dtype=torch.float32)
+
+    with ck.use_backend("xpu"):
+        actual = ck.group_norm_silu_pad3d(
+            x, weight, bias, num_groups=8, pad=(1, 1, 1, 1, 1),
+        )
+    frames = x.permute(0, 2, 1, 3, 4).reshape(2, 32, 4, 4)
+    normalized = torch.nn.functional.group_norm(frames, 8, weight, bias, 1e-6)
+    expected = normalized.reshape(1, 2, 32, 4, 4).permute(0, 2, 1, 3, 4)
+    expected = torch.nn.functional.pad(torch.nn.functional.silu(expected), (1, 1, 1, 1, 0, 0), mode="reflect")
+    expected = torch.nn.functional.pad(expected, (0, 0, 0, 0, 1, 0))
+    torch.testing.assert_close(actual, expected)
+    assert "group_norm_silu_pad3d" in ck.list_backends()["xpu"]["capabilities"]
+
+
+def test_xpu_group_norm_zero_pad_accepts_wide_border_and_strided_input():
+    base = torch.randn(1, 32, 2, 2, 4, device="xpu", dtype=torch.float16)
+    x = base[..., ::2]
+    assert not x.is_contiguous()
+    pad = (3, 3, 3, 3, 0)
+    with ck.use_backend("xpu"):
+        actual = ck.group_norm_silu_pad3d(
+            x, None, None, 1, 0.0, pad, silu=False, zero_pad=True,
+        )
+    expected = torch.nn.functional.pad(x, (3, 3, 3, 3, 0, 0))
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_xpu_group_norm_zero_pad_writes_frame_offset_out_view():
+    x = torch.randn(1, 32, 2, 4, 5, device="xpu", dtype=torch.float16)
+    weight = torch.randn(32, device="xpu", dtype=torch.float16)
+    bias = torch.randn(32, device="xpu", dtype=torch.float16)
+    pad = (1, 1, 1, 1, 0)
+    buffer = torch.full(
+        (1, 32, 4, 6, 7), 7.0, device="xpu", dtype=torch.float16,
+    ).contiguous(memory_format=torch.channels_last_3d)
+    view = buffer[:, :, 2:]
+    with ck.use_backend("xpu"):
+        expected = ck.group_norm_silu_pad3d(
+            x, weight, bias, 8, 1e-6, pad, zero_pad=True,
+        )
+        actual = ck.group_norm_silu_pad3d(
+            x, weight, bias, 8, 1e-6, pad, zero_pad=True, out=view,
+        )
+    assert actual.data_ptr() == view.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert bool((buffer[:, :, :2] == 7).all())
+    assert "group_norm_silu_pad3d_out" in ck.list_backends()["xpu"]["capabilities"]
+
+
+def test_xpu_group_norm_out_fullgraph_compile():
+    x = torch.randn(1, 8, 2, 4, 5, device="xpu", dtype=torch.float16)
+    eager_out = torch.empty(1, 8, 2, 6, 7, device="xpu", dtype=torch.float16)
+    compiled_out = torch.empty_like(eager_out)
+
+    def run(inp, out):
+        return ck.group_norm_silu_pad3d(
+            inp, None, None, 1, 0.0, (1, 1, 1, 1, 0),
+            silu=False, zero_pad=True, out=out,
+        )
+
+    with ck.use_backend("xpu"):
+        expected = run(x, eager_out)
+        actual = torch.compile(run, backend="eager", fullgraph=True)(x, compiled_out)
+    assert actual.data_ptr() == compiled_out.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rows,columns,width", [
+    (1, 512, 512), (8, 1024, 1024), (64, 1152, 1152),
+])
+def test_xpu_awq_w4a16_matches_eager(rows, columns, width):
+    torch.manual_seed(20260927)
+    x = torch.randn(rows, width, device="xpu", dtype=torch.bfloat16)
+    packed = torch.randint(
+        0, 256, (columns, width // 2), device="xpu", dtype=torch.uint8,
+    ).view(torch.int8)
+    scales = torch.randn(width // 64, columns, device="xpu", dtype=torch.bfloat16).abs() * 0.01
+    zeros = torch.randn(width // 64, columns, device="xpu", dtype=torch.bfloat16) * 0.01
+    bias = torch.randn(columns, device="xpu", dtype=torch.bfloat16)
+
+    with ck.use_backend("xpu"):
+        actual = ck.gemv_awq_w4a16(x, packed, scales, zeros, bias, 64)
+    with ck.use_backend("eager"):
+        expected = ck.gemv_awq_w4a16(x, packed, scales, zeros, bias, 64)
+    relative = (
+        (actual.float() - expected.float()).norm() /
+        expected.float().norm().clamp_min(1e-9)
+    ).item()
+    assert relative < 1e-2
+    assert "gemv_awq_w4a16" in ck.list_backends()["xpu"]["capabilities"]
+
+
+def test_xpu_awq_w4a16_fullgraph_compile():
+    x = torch.randn(1, 128, device="xpu", dtype=torch.bfloat16)
+    packed = torch.randint(0, 256, (32, 64), device="xpu", dtype=torch.uint8).view(torch.int8)
+    scales = torch.ones(2, 32, device="xpu", dtype=torch.bfloat16) * 0.01
+    zeros = torch.zeros_like(scales)
+
+    def run(inp):
+        return ck.gemv_awq_w4a16(inp, packed, scales, zeros, None, 64)
+
+    with ck.use_backend("xpu"):
+        expected = run(x)
+        actual = torch.compile(run, backend="eager", fullgraph=True)(x)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_xpu_awq_w4a16_3d_input_uses_scale_dtype():
+    x = torch.randn(2, 2, 128, device="xpu", dtype=torch.float16)
+    packed = torch.randint(0, 256, (32, 64), device="xpu", dtype=torch.uint8).view(torch.int8)
+    scales = torch.ones(2, 32, device="xpu", dtype=torch.bfloat16) * 0.01
+    zeros = torch.zeros_like(scales)
+    with ck.use_backend("xpu"):
+        actual = ck.gemv_awq_w4a16(x, packed, scales, zeros, None, 64)
+    with ck.use_backend("eager"):
+        expected = ck.gemv_awq_w4a16(x, packed, scales, zeros, None, 64)
+    assert actual.shape == (2, 2, 32)
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=1e-2, atol=1e-2)
+
+
+def test_xpu_fp16_linear_uses_native_route():
+    x = torch.randn(8, 128, device="xpu", dtype=torch.float16)
+    weight = torch.randn(64, 128, device="xpu", dtype=torch.float16)
+    residual = torch.randn(8, 64, device="xpu", dtype=torch.float16)
+    residual_scale = torch.randn(64, device="xpu", dtype=torch.float16)
+
+    with ck.use_backend("xpu"):
+        actual = ck.fp16_linear(x, weight, residual=residual, residual_scale=residual_scale)
+    expected = torch.addcmul(residual, torch.nn.functional.linear(x, weight), residual_scale)
+    from tests.conftest import fp16_accum_tol, rel_err
+
+    assert rel_err(actual.float(), expected.float()) < fp16_accum_tol(128)
+    assert "fp16_linear" in ck.list_backends()["xpu"]["capabilities"]
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -120,6 +333,40 @@ def test_xpu_rope_arbitrary_matrix_pair_semantics(split_half, layout):
         rtol = atol = 0.07 if freqs.dtype == torch.bfloat16 else 1e-3
     torch.testing.assert_close(actual_q, expected_q, rtol=rtol, atol=atol)
     torch.testing.assert_close(actual_k, expected_k, rtol=rtol, atol=atol)
+
+
+def test_xpu_rope_layout_cache_uses_kitchen_allocation_context():
+    from omni_xpu_kernel.cute import sol_attn_v2
+
+    class CountingContext:
+        entries = 0
+
+        def __enter__(self):
+            self.entries += 1
+
+        def __exit__(self, *_exc):
+            return False
+
+    t, rot = 3, 8
+    freqs = torch.arange(t * rot * 2, device="xpu", dtype=torch.float32)
+    freqs = freqs.reshape(t, rot // 2, 2, 2).transpose(0, 1)
+    assert not freqs.is_contiguous()
+    context = CountingContext()
+    ck.set_allocation_context(context)
+    try:
+        first = sol_attn_v2._cached_rope_freqs(freqs, t, rot)
+        second = sol_attn_v2._cached_rope_freqs(freqs, t, rot)
+        assert first is second
+        assert context.entries == 1
+        torch.testing.assert_close(first, freqs.reshape(1, t, 1, rot // 2, 2, 2))
+        freqs.add_(1)
+        updated = sol_attn_v2._cached_rope_freqs(freqs, t, rot)
+        assert updated is not first
+        assert context.entries == 2
+        torch.testing.assert_close(updated, freqs.reshape(1, t, 1, rot // 2, 2, 2))
+    finally:
+        ck.set_allocation_context(None)
+        sol_attn_v2._ROPE_FREQ_CACHE.clear()
 
 
 @pytest.mark.parametrize("scale_dtype", [torch.float32, torch.bfloat16])
@@ -396,6 +643,41 @@ def test_xpu_int8_linear_single_row_bias_and_dtype(dtype):
     assert error.max().item() < 0.75
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_xpu_int8_linear_two_row_ar_cfg_matches_eager(dtype):
+    """The two-row AR/CFG route retains Kitchen's public scale/bias contract."""
+    x = torch.randn(2, 256, device="xpu", dtype=dtype)
+    weight = torch.randn(96, 256, device="xpu", dtype=dtype)
+    bias = torch.randn(96, device="xpu", dtype=dtype)
+    with ck.use_backend("xpu"):
+        qweight, scale = ck.quantize_int8_tensorwise(weight)
+        actual = ck.int8_linear(x, qweight, scale, bias, dtype)
+    with ck.use_backend("eager"):
+        expected = ck.int8_linear(x, qweight, scale, bias, dtype)
+    error = (actual.float() - expected.float()).abs()
+    assert actual.shape == (2, 96)
+    assert actual.dtype == dtype
+    assert error.mean().item() < 0.15
+    assert error.max().item() < 0.75
+
+
+def test_xpu_int8_two_row_residual_matches_composed_route():
+    x = torch.randn(2, 256, device="xpu", dtype=torch.bfloat16)
+    weight = torch.randn(96, 256, device="xpu", dtype=torch.bfloat16)
+    bias = torch.randn(96, device="xpu", dtype=torch.bfloat16)
+    residual = torch.randn(2, 96, device="xpu", dtype=torch.bfloat16)
+    residual_scale = torch.randn(96, device="xpu", dtype=torch.bfloat16)
+    with ck.use_backend("xpu"):
+        qweight, scale = ck.quantize_int8_tensorwise(weight)
+        actual = ck.int8_linear(
+            x, qweight, scale, bias, torch.bfloat16,
+            residual=residual, residual_scale=residual_scale,
+        )
+        linear = ck.int8_linear(x, qweight, scale, bias, torch.bfloat16)
+    expected = torch.addcmul(residual, linear, residual_scale)
+    torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.03)
+
+
 def test_xpu_int8_linear_swiglu_input_act():
     rows, hidden, output = 37, 256, 96
     x = torch.randn(rows, 2 * hidden, device="xpu", dtype=torch.bfloat16)
@@ -586,6 +868,82 @@ def test_xpu_int8_linear_matches_eager():
     error = (actual.float() - expected.float()).abs()
     assert error.mean().item() < 0.15
     assert error.max().item() < 0.75
+
+
+def test_xpu_int8_linear_rms_norm_and_residual_match_composed_route():
+    x = torch.randn(8, 128, device="xpu", dtype=torch.bfloat16)
+    weight = torch.randn(64, 128, device="xpu", dtype=torch.bfloat16)
+    norm_weight = torch.randn(128, device="xpu", dtype=torch.bfloat16)
+    residual = torch.randn(8, 64, device="xpu", dtype=torch.bfloat16)
+    residual_scale = torch.randn(64, device="xpu", dtype=torch.bfloat16)
+
+    with ck.use_backend("xpu"):
+        qweight, weight_scale = ck.quantize_int8_tensorwise(weight)
+        actual = ck.int8_linear(
+            x, qweight, weight_scale, out_dtype=torch.bfloat16,
+            input_act="rms_norm", input_act_weight=norm_weight, input_act_eps=1e-6,
+            residual=residual, residual_scale=residual_scale,
+        )
+        normalized = torch.nn.functional.rms_norm(
+            x, (x.shape[-1],), weight=norm_weight, eps=1e-6,
+        )
+        linear = ck.int8_linear(normalized, qweight, weight_scale, out_dtype=torch.bfloat16)
+    expected = torch.addcmul(residual, linear, residual_scale)
+    # Match the CUDA fused-epilogue contract: its final FP32 addcmul can
+    # differ by rounding from a separately materialized BF16 projection.
+    assert rel_err(actual, expected) < 1e-2
+
+
+def test_xpu_int8_linear_rms_norm_and_residual_compile():
+    x = torch.randn(4, 128, device="xpu", dtype=torch.bfloat16)
+    weight = torch.randn(64, 128, device="xpu", dtype=torch.bfloat16)
+    norm_weight = torch.randn(128, device="xpu", dtype=torch.bfloat16)
+    residual = torch.randn(4, 64, device="xpu", dtype=torch.bfloat16)
+    residual_scale = torch.randn(64, device="xpu", dtype=torch.bfloat16)
+    with ck.use_backend("xpu"):
+        qweight, weight_scale = ck.quantize_int8_tensorwise(weight)
+
+    @torch.compile(backend="eager", fullgraph=True)
+    def compiled(inp, norm, add, add_scale):
+        return ck.int8_linear(
+            inp, qweight, weight_scale, out_dtype=torch.bfloat16,
+            input_act="rms_norm", input_act_weight=norm, input_act_eps=1e-6,
+            residual=add, residual_scale=add_scale,
+        )
+
+    with ck.use_backend("xpu"):
+        actual = compiled(x, norm_weight, residual, residual_scale)
+        expected = ck.int8_linear(
+            x, qweight, weight_scale, out_dtype=torch.bfloat16,
+            input_act="rms_norm", input_act_weight=norm_weight, input_act_eps=1e-6,
+            residual=residual, residual_scale=residual_scale,
+        )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_xpu_int8_rms_norm_convrot_residual_compile():
+    x = torch.randn(2, 256, device="xpu", dtype=torch.bfloat16)
+    weight = torch.randint(-127, 128, (64, 256), device="xpu", dtype=torch.int8)
+    weight_scale = torch.tensor(0.01, device="xpu")
+    norm_weight = torch.randn(256, device="xpu", dtype=torch.bfloat16)
+    residual = torch.randn(2, 64, device="xpu", dtype=torch.bfloat16)
+    residual_scale = torch.randn(64, device="xpu", dtype=torch.bfloat16)
+
+    def run(input, norm, add, add_scale):
+        return ck.int8_linear(
+            input, weight, weight_scale, out_dtype=torch.bfloat16,
+            convrot=True, convrot_groupsize=256,
+            input_act="rms_norm", input_act_weight=norm,
+            input_act_eps=1e-6, residual=add,
+            residual_scale=add_scale,
+        )
+
+    with ck.use_backend("xpu"):
+        expected = run(x, norm_weight, residual, residual_scale)
+        actual = torch.compile(run, backend="eager", fullgraph=True)(
+            x, norm_weight, residual, residual_scale,
+        )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_xpu_int8_primitive_cache_hits():

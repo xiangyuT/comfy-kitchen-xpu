@@ -46,8 +46,8 @@ the upstream maintainers and contributors for the library architecture,
 operator APIs, QuantizedTensor design, backend registry, eager/CUDA/Triton
 implementations, packaging, and tests on which this work is built.
 
-The XPU development line is based on upstream Comfy Kitchen `0.2.33` at
-[`e9ea99c`](https://github.com/Comfy-Org/comfy-kitchen/commit/e9ea99cf2f0af1d0c49c04690d4153a91c2b8668).
+The XPU development line is based on upstream Comfy Kitchen `0.2.35` at
+[`b2a2972`](https://github.com/Comfy-Org/comfy-kitchen/commit/b2a2972ac68c395bbda8ad9030e8ae1089287815).
 The Intel-specific work in this fork is intentionally optional: importing
 Comfy Kitchen remains safe when PyTorch XPU, `omni_xpu_kernel`, its native
 extension, or Intel GPU hardware is absent.
@@ -70,6 +70,9 @@ The original upstream CUDA and generic-backend README is retained
   RoPE, fused RMSNorm+RoPE (including partial split-half in-place views), AdaLN,
   RMS-AdaLN, fused SwiGLU+INT8 input quantization, ConvRot W4A4, FP8 W8A16,
   managed GGUF dequantization, and Nunchaku-compatible SVDQuant W4A16 dispatch.
+- Native XPU routes for Gated Delta decode, causal DeltaNet convolution,
+  per-frame GroupNorm with SiLU and padding, FP16 linear and Conv3D, and the
+  RMSNorm and scaled-residual stages of INT8 linear.
 - XPU-aware QuantizedTensor lifecycle, device migration, `linear`, `mm`,
   `addmm`, transpose, serialization, and prepared-weight paths.
 - Target-checked companion-wheel construction for BMG and PTL-H, including
@@ -77,9 +80,80 @@ The original upstream CUDA and generic-backend README is retained
   validation.
 - XPU operator tests, portable tensor tests, and self-hosted device workflows.
 
-Excluding the explicitly deferred NVFP4, MXFP8, and AWQ formats, the XPU
-backend registers each capability independently from the native symbols
+The XPU backend registers each capability independently from the native symbols
 available in the installed companion wheel.
+
+## XPU support matrix
+
+This matrix follows the [upstream per-function format](https://github.com/Comfy-Org/comfy-kitchen#backend-capabilities-matrix)
+for the fork's `0.2.35` API and matching `omni_xpu_kernel` companion package.
+✓ means the fork has a native XPU route when the matching companion symbol is
+present; an empty cell means it does not. Triton or PyTorch eager fallbacks do
+not count as XPU backend support. A ✓ may still have dtype, shape, layout, or
+numeric limits.
+
+| Function | xpu |
+| --- | --- |
+| `quantize_per_tensor_fp8` | ✓ |
+| `dequantize_per_tensor_fp8` | ✓ |
+| `stochastic_rounding_fp8` | ✓ |
+| `quantize_nvfp4` | |
+| `dequantize_nvfp4` | |
+| `scaled_mm_nvfp4` | |
+| `quantize_mxfp8` | |
+| `dequantize_mxfp8` | |
+| `scaled_mm_mxfp8` | |
+| `adaln` | ✓ |
+| `rms_adaln` | ✓ |
+| `na3d` | |
+| `na2d` | |
+| `sol_attn` | ✓ |
+| `int8_attention` | |
+| `apply_rope` | ✓ |
+| `apply_rope1` | ✓ |
+| `apply_rope_split_half` | ✓ |
+| `apply_rope_split_half1` | ✓ |
+| `rms_rope` | ✓ |
+| `rms_rope1` | ✓ |
+| `rms_rope_split_half` | ✓ |
+| `rms_rope_split_half1` | ✓ |
+| `quantize_int8_rowwise` | ✓ |
+| `quantize_int8_tensorwise` | ✓ |
+| `quantize_and_rotate_rowwise` | ✓ |
+| `quantize_int8_convrot_weight` | ✓ |
+| `dequantize_int8_simple` | ✓ |
+| `dequantize_int8_simple_dtype` | ✓ |
+| `dequantize_int8_convrot_weight_dtype` | ✓ |
+| `int8_linear` | ✓ |
+| `gemv_awq_w4a16` | ✓ |
+| `quantize_svdquant_w4a4` | ✓ |
+| `scaled_mm_svdquant_w4a4` | ✓ |
+| `convrot_w4a4_linear` | ✓ |
+| `quantize_convrot_w4a4_weight` | ✓ |
+| `dequantize_convrot_w4a4_weight` | ✓ |
+| `fp16_linear` | ✓ |
+| `fp16_conv3d` | ✓ |
+| `group_norm_silu_pad3d` | ✓ |
+| `gated_delta_decode_fused` | ✓ |
+| `deltanet_conv_step` | ✓ |
+| `sol_attn_chunked` | ✓ |
+| `svdquant_w4a16_linear` | ✓ |
+| `dequantize_gguf` | ✓ |
+| `prequantize_int8_attention` | |
+| `int8_attention_from_prequantized` | |
+| `flash_attention_decode` | |
+| `quantize_w4a8_int8_weight` | |
+| `dequantize_w4a8_int8_weight` | |
+| `w4a8_int8_linear` | |
+
+The eight RoPE functions also have in-place forms with the same XPU coverage.
+
+Upstream `main` has additional changes after this fork's source base. The
+`zero_pad`/`out`/strided-view forms for Conv3D and GroupNorm are selectively
+integrated here. W6A8 and 256-dimensional Flash decode are **not yet
+integrated** into the fork. Runtime
+capability detection is the authority for the installed companion wheel:
+`ck.list_backends()["xpu"]["capabilities"]`.
 
 ## XPU backend behavior
 
@@ -95,8 +169,9 @@ The XPU backend becomes available only when:
 2. `omni_xpu_kernel` and its native extension load;
 3. the required native INT8 symbols are present.
 
-Optional SVDQuant W4A4/W4A16, normalization, FP8, RoPE, ConvRot, and GGUF
-capability groups are detected separately. A partial or older native package
+Optional SVDQuant W4A4/W4A16, normalization, FP8, RoPE, ConvRot, GGUF, and
+new Kitchen operator capability groups are detected separately. A partial or
+older native package
 therefore advertises only the operations it actually implements. Triton
 remains available on non-Windows XPU stacks that support it, with eager
 implementations as the portable fallback.
@@ -149,7 +224,7 @@ git clone https://github.com/xiangyuT/comfy-kitchen-xpu.git
 cd comfy-kitchen-xpu
 python -m pip install build
 python -m build --wheel
-pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.31-py3-none-any.whl
+pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.35-py3-none-any.whl
 ```
 
 The repository retains upstream CUDA source to keep future upstream updates
@@ -205,7 +280,9 @@ revision/version and XPU target.
 
 - Intel XPU support remains experimental and is not an upstream Comfy Kitchen
   release claim.
-- NVFP4, MXFP8, and AWQ are explicitly deferred for XPU.
+- NVFP4 and MXFP8 currently use fallback implementations on XPU and remain
+  native-kernel gaps. AWQ dtypes outside the native FP16/BF16 path use eager.
+- The W4A8 decode GEMV optimization is deferred for XPU.
 - Native wheels are CPython-, Torch-ABI-, and target-specific.
 - BMG and PTL-H performance numbers are not portable across devices.
 - Full-image measurements include changes outside Kitchen and cannot establish
@@ -244,7 +321,6 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `rms_adaln`                 | ✓     | ✓    | ✓      | ✓   |
 | `na3d`                      | ✓     | ✓    | ✓      | ✓   |
 | `na2d`                      | ✓     | ✓    | ✓      | ✓   |
-| `sol_attn`                  | ✓     | ✓    |        | ✓   |
 | `int8_attention`            |       | ✓    |        | ✓   |
 | `apply_rope`                | ✓     | ✓    | ✓      | ✓   |
 | `apply_rope1`               | ✓     | ✓    | ✓      | ✓   |
@@ -464,7 +540,7 @@ python setup.py build_ext --debug-build --lineinfo bdist_wheel
 ### Requirements
 
 - **Python**: ≥3.10
-- **PyTorch**: ≥2.7.0
+- **PyTorch**: ≥2.5.0
 - **CUDA Runtime** (for CUDA wheels): ≥13.0
   - Pre-built wheels require NVIDIA Driver r580+
   - Building from source requires CUDA Toolkit ≥12.8 and `CUDA_HOME` environment variable
