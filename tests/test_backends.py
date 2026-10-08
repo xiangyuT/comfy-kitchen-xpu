@@ -23,6 +23,7 @@ class TestBackendSystem:
         assert "eager" in backends
         assert "xpu" in backends
         assert "triton" in backends
+        assert "ascend" in backends
 
         # Eager backend should always be available
         assert backends["eager"]["available"] is True
@@ -119,6 +120,13 @@ assert "{env_name}=1" not in reason, status
         if backends.get("cuda", {}).get("available", False):
             cuda_caps = backends["cuda"]["capabilities"]
             assert "int8_linear" in cuda_caps
+
+        if backends["ascend"]["available"]:
+            ascend_caps = backends["ascend"]["capabilities"]
+            assert {
+                "dequantize_int8_simple",
+                "dequantize_int8_simple_dtype",
+            }.issubset(ascend_caps)
 
         if backends["xpu"]["available"]:
             from comfy_kitchen.backends import xpu

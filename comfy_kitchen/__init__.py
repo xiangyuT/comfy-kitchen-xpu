@@ -7,6 +7,7 @@ from .allocation import set_allocation_context
 _cuda_backend = None
 
 # Import backends to trigger auto-registration
+from .backends import ascend as _ascend_backend  # noqa: F401
 from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
 from .backends import xpu as _xpu_backend  # noqa: F401
