@@ -46,8 +46,8 @@ the upstream maintainers and contributors for the library architecture,
 operator APIs, QuantizedTensor design, backend registry, eager/CUDA/Triton
 implementations, packaging, and tests on which this work is built.
 
-The XPU development line is based on upstream Comfy Kitchen `0.2.35` at
-[`b2a2972`](https://github.com/Comfy-Org/comfy-kitchen/commit/b2a2972ac68c395bbda8ad9030e8ae1089287815).
+The XPU development line is based on upstream Comfy Kitchen `0.2.37` at
+[`be003b7`](https://github.com/Comfy-Org/comfy-kitchen/commit/be003b7c23c5b01328657955b8bc5d3f073d868e).
 The Intel-specific work in this fork is intentionally optional: importing
 Comfy Kitchen remains safe when PyTorch XPU, `omni_xpu_kernel`, its native
 extension, or Intel GPU hardware is absent.
@@ -86,7 +86,7 @@ available in the installed companion wheel.
 ## XPU support matrix
 
 This matrix follows the [upstream per-function format](https://github.com/Comfy-Org/comfy-kitchen#backend-capabilities-matrix)
-for the fork's `0.2.35` API and matching `omni_xpu_kernel` companion package.
+for the fork's `0.2.37` API and matching `omni_xpu_kernel` companion package.
 ✓ means the fork has a native XPU route when the matching companion symbol is
 present; an empty cell means it does not. Triton or PyTorch eager fallbacks do
 not count as XPU backend support. A ✓ may still have dtype, shape, layout, or
@@ -144,15 +144,14 @@ numeric limits.
 | `flash_attention_decode` | |
 | `quantize_w4a8_int8_weight` | |
 | `dequantize_w4a8_int8_weight` | |
-| `w4a8_int8_linear` | |
+| `w4a8_int8_linear` | ✓ |
 
 The eight RoPE functions also have in-place forms with the same XPU coverage.
 
-Upstream `main` has additional changes after this fork's source base. The
-`zero_pad`/`out`/strided-view forms for Conv3D and GroupNorm are selectively
-integrated here. W6A8 and 256-dimensional Flash decode are **not yet
-integrated** into the fork. Runtime
-capability detection is the authority for the installed companion wheel:
+The `zero_pad`/`out`/strided-view forms for Conv3D and GroupNorm remain
+available. W4A8 and W6A8 use the upstream packed layout and quantization
+contract; Flash decode remains unavailable on XPU. Runtime capability
+detection is the authority for the installed companion wheel:
 `ck.list_backends()["xpu"]["capabilities"]`.
 
 ## XPU backend behavior
@@ -224,13 +223,13 @@ git clone https://github.com/xiangyuT/comfy-kitchen-xpu.git
 cd comfy-kitchen-xpu
 python -m pip install build
 python -m build --wheel
-pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.35-py3-none-any.whl
+pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.37-py3-none-any.whl
 ```
 
 The repository retains upstream CUDA source to keep future upstream updates
 reviewable. The XPU wheel does not probe for CUDA, compile the CUDA extension,
 or package `comfy_kitchen.backends.cuda`; it contains the XPU, Triton, and eager
-Python backends only.
+Python backends, plus the optional upstream Ascend Python module.
 
 ### Build the target-specific companion wheel
 
@@ -282,7 +281,9 @@ revision/version and XPU target.
   release claim.
 - NVFP4 and MXFP8 currently use fallback implementations on XPU and remain
   native-kernel gaps. AWQ dtypes outside the native FP16/BF16 path use eager.
-- The W4A8 decode GEMV optimization is deferred for XPU.
+- W4A8/W6A8 linear uses the native INT8 GEMM after upstream-compatible XPU
+  tensor preparation. Asymmetric correction retains eager; packed decode and
+  requantization do not have dedicated native XPU kernels.
 - Native wheels are CPython-, Torch-ABI-, and target-specific.
 - BMG and PTL-H performance numbers are not portable across devices.
 - Full-image measurements include changes outside Kitchen and cannot establish

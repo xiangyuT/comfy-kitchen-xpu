@@ -49,6 +49,7 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (
     _decide_codebook,
     _dequantize_w4a8_int8_weight_from_int8,
     _quantize_w4a8_chunked,
+    _w4a8_geometry,
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
@@ -836,9 +837,8 @@ def _dequant_int4_grouped_to_int8(
     codebook: torch.Tensor | None,
     group_size: int,
 ) -> torch.Tensor:
-    """Decode packed INT4 weights to the grouped INT8 grid the GEMM consumes."""
-    n, k_half = qdata.shape
-    k = k_half * 2
+    """Decode packed INT4/INT6 weights to the grouped INT8 grid the GEMM consumes."""
+    n, k, _bits = _w4a8_geometry(qdata, s_rel, group_size)
     device = qdata.device
     qdata_arg = _operand(qdata, device, "qdata")
     scale_code = DTYPE_TO_CODE[s_rel.dtype]
@@ -937,8 +937,7 @@ def _w4a8_int8_linear_chunked(
     convrot_groupsize: int,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    n, k_half = qdata.shape
-    k = k_half * 2
+    n, k, _bits = _w4a8_geometry(qdata, s_rel, group_size)
     device = x.device
     orig_shape = x.shape
     x2d = x.reshape(-1, k).contiguous()
@@ -1011,67 +1010,111 @@ def _w4a8_int8_linear_chunked(
     return out.reshape(*orig_shape[:-1], n)
 
 
-# Keyed by device: the fused requantize holds one float per 16-wide group in LDS,
-# so the widest K it can take is a property of whichever card the weight lives on.
-_w4a8_requant_max_k: dict[int, int] = {}
+# Keyed by device and group size: the fused requantize holds the rotated row and one
+# float per group in LDS, so the widest K it can take is a property of whichever card
+# the weight lives on.
+_wxa8_requant_max_k: dict[tuple[int, int], int] = {}
 
 
-def _requant_supported(k: int, device: torch.device, dtype: torch.dtype) -> bool:
+def _requant_supported(k: int, group_size: int, device: torch.device, dtype: torch.dtype) -> bool:
     """Whether the fused requantize can take a row of this width on ``device``.
 
     The budget is read for the weight's own device rather than the process-current
     one, so a multi-GPU process asks the card the kernel will actually launch on.
+    fp32 weights take the staged path, as on CUDA.
     """
-    if not _EXT_AVAILABLE or k % 16 != 0:
+    if not _EXT_AVAILABLE or k % 256 != 0 or k % group_size != 0:
         return False
-    if dtype not in (torch.float32, torch.float16, torch.bfloat16):
+    if dtype not in (torch.float16, torch.bfloat16):
         return False
 
     index = device.index if device.index is not None else torch.cuda.current_device()
-    max_k = _w4a8_requant_max_k.get(index)
+    key = (index, group_size)
+    max_k = _wxa8_requant_max_k.get(key)
     if max_k is None:
         with torch.cuda.device(index):
-            max_k = _C.w4a8_requant_max_k()
-        _w4a8_requant_max_k[index] = max_k
+            max_k = _C.wxa8_requant_max_k(group_size)
+        _wxa8_requant_max_k[key] = max_k
     return max_k > 0 and k <= max_k
 
 
-def _fused_quantize_w4a8(
+def _fused_quantize_wxa8(
+    weight: torch.Tensor,
+    bits: int,
+    group_size: int,
+    codebook: torch.Tensor | None,
+    stochastic_rounding: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, torch.Tensor | None]:
+    """ConvRot and requantize the raw weight in one launch, with no rotated copy."""
+    n, k = weight.shape
+    dev = weight.device
+    if bits == 4:
+        cb = codebook.to(device=dev, dtype=torch.float32).contiguous()
+        packed = torch.empty(n, k // 2, dtype=torch.int8, device=dev)
+    else:
+        cb = torch.empty(0, dtype=torch.float32, device=dev)
+        packed = torch.empty(n, k * 3 // 4, dtype=torch.int8, device=dev)
+    s_rel = torch.empty(n, k // group_size, dtype=torch.float8_e4m3fn, device=dev)
+    s_channel = torch.empty(n, dtype=torch.float32, device=dev)
+    with torch.cuda.device(dev):
+        _C.quantize_wxa8_convrot_fused(
+            _dl(_aligned(weight.contiguous())),
+            _dl(cb),
+            _dl(packed),
+            _dl(s_rel.view(torch.uint8)),
+            _dl(s_channel),
+            n,
+            k,
+            bits,
+            group_size,
+            stochastic_rounding > 0,
+            int(stochastic_rounding) if stochastic_rounding > 0 else 0,
+            _stream(weight),
+        )
+    return packed, s_rel, s_channel, None, (cb if bits == 4 else None)
+
+
+_W4A8_STAGED_QUANT = _EXT_AVAILABLE
+# The staged kernel keeps only K/16 fp32 group scales in LDS. Same limit as CUDA's,
+# which reserves room for its static arrays within the 48 KiB default block limit.
+_W4A8_STAGED_MAX_K = 16 * (47 * 1024 // 4)
+
+
+def _quantize_w4a8_staged(
     weight: torch.Tensor,
     codebook: torch.Tensor,
     convrot_groupsize: int,
     stochastic_rounding: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, torch.Tensor]:
-    """Rotate and requantize a row block at a time, so no whole rotated copy is held.
-
-    Every output is per-row and the kernel reduces only within a row, so a block
-    writes straight into its own output slices.
-    """
+    """Rotate, then requantize in a second launch, a row block at a time so no full
+    rotated copy is held. Every output is per row, so each block writes straight into
+    its slice."""
     n, k = weight.shape
-    cb = codebook.to(device=weight.device, dtype=torch.float32).contiguous()
-    packed = torch.empty(n, k // 2, dtype=torch.int8, device=weight.device)
-    s_rel = torch.empty(n, k // 16, dtype=torch.float8_e4m3fn, device=weight.device)
-    s_channel = torch.empty(n, dtype=torch.float32, device=weight.device)
+    dev = weight.device
+    cb = codebook.to(device=dev, dtype=torch.float32).contiguous()
+    packed = torch.empty(n, k // 2, dtype=torch.int8, device=dev)
+    s_rel = torch.empty(n, k // 16, dtype=torch.float8_e4m3fn, device=dev)
+    s_channel = torch.empty(n, dtype=torch.float32, device=dev)
     block = max(1, _QUANT_ROW_ELEM_BUDGET // max(k, 1))
-    for r0 in range(0, n, block):
-        r1 = min(r0 + block, n)
-        rot = _eager.rotate_int8_convrot_weight(weight[r0:r1].contiguous(), convrot_groupsize)
-        # Offset the seed by the row start so blocks decorrelate but a fixed block
-        # size still reproduces.
-        seed = stochastic_rounding + r0 if stochastic_rounding > 0 else 0
-        _C.quantize_w4a8_convrot(
-            _dl(rot.contiguous()),
-            _dl(cb),
-            _dl(packed[r0:r1]),
-            _dl(s_rel[r0:r1].view(torch.uint8)),
-            _dl(s_channel[r0:r1]),
-            r1 - r0,
-            k,
-            stochastic_rounding > 0,
-            seed,
-            _stream(weight),
-        )
-        del rot
+    with torch.cuda.device(dev):
+        for r0 in range(0, n, block):
+            r1 = min(r0 + block, n)
+            rot = _eager.rotate_int8_convrot_weight(weight[r0:r1].contiguous(), convrot_groupsize)
+            # Offset per block like the eager packer, so blocks decorrelate yet stay deterministic.
+            seed = stochastic_rounding + r0 if stochastic_rounding > 0 else 0
+            _C.quantize_w4a8_convrot(
+                _dl(rot.contiguous()),
+                _dl(cb),
+                _dl(packed[r0:r1]),
+                _dl(s_rel[r0:r1].view(torch.uint8)),
+                _dl(s_channel[r0:r1]),
+                r1 - r0,
+                k,
+                seed > 0,
+                seed,
+                _stream(weight),
+            )
+            del rot
     return packed, s_rel, s_channel, None, cb
 
 
@@ -1084,6 +1127,8 @@ def quantize_w4a8_int8_weight(
     codebook: bool = True,
     codebook_tensor: torch.Tensor | None = None,
     stochastic_rounding: int = 0,
+    bits: int = 4,
+    scale_search: bool = True,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1091,25 +1136,45 @@ def quantize_w4a8_int8_weight(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    """Prepare W4A8 weights with the fused HIP requantize and eager ConvRot."""
-    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize)
-    # The fused kernel covers the default codebook layout only. Asymmetric, uniform,
-    # fp32-scale and other group sizes stay on the chunked eager path.
-    if (
-        symmetric
-        and codebook
-        and group_size == 16
-        and scale_dtype == torch.float8_e4m3fn
-        and _requant_supported(weight.shape[1], weight.device, weight.dtype)
-    ):
-        cb = (
-            codebook_tensor
-            if codebook_tensor is not None
-            else _decide_codebook(
-                weight, _eager.rotate_int8_convrot_weight, group_size, convrot_groupsize
-            )
+    """Prepare W4A8/W6A8 weights: the fused HIP ConvRot + requantize for the default
+    configs (4-bit symmetric codebook g16, or 6-bit without the quantize-time scale
+    search; fp8 scales). W4A8 the fused kernel declines takes the staged HIP requantize;
+    everything else the chunked eager path."""
+    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits)
+    layout_ok = (
+        scale_dtype == torch.float8_e4m3fn
+        and symmetric
+        and (
+            (bits == 4 and codebook and group_size == 16)
+            or (bits == 6 and not scale_search and group_size in (16, 32, 64))
         )
-        return _fused_quantize_w4a8(weight, cb, convrot_groupsize, stochastic_rounding)
+    )
+    fused_ok = (
+        layout_ok
+        and convrot_groupsize == 256
+        and _requant_supported(weight.shape[1], group_size, weight.device, weight.dtype)
+    )
+    staged_ok = (
+        layout_ok
+        and not fused_ok
+        and bits == 4
+        and _W4A8_STAGED_QUANT
+        and weight.dtype in (torch.float32, torch.float16, torch.bfloat16)
+        and weight.shape[1] <= _W4A8_STAGED_MAX_K
+    )
+    if fused_ok or staged_ok:
+        cb = None
+        if bits == 4:
+            cb = (
+                codebook_tensor
+                if codebook_tensor is not None
+                else _decide_codebook(
+                    weight, _eager.rotate_int8_convrot_weight, group_size, convrot_groupsize
+                )
+            )
+        if staged_ok:
+            return _quantize_w4a8_staged(weight, cb, convrot_groupsize, stochastic_rounding)
+        return _fused_quantize_wxa8(weight, bits, group_size, cb, stochastic_rounding)
     return _quantize_w4a8_chunked(
         weight,
         _eager.rotate_int8_convrot_weight,
@@ -1120,6 +1185,8 @@ def quantize_w4a8_int8_weight(
         codebook=codebook,
         codebook_override=codebook_tensor,
         stochastic_rounding=stochastic_rounding,
+        bits=bits,
+        scale_search=scale_search,
     )
 
 
@@ -1158,7 +1225,7 @@ def w4a8_int8_linear(
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """``x @ W.T + bias`` via the HIP INT4 decode feeding the WMMA INT8 GEMM.
+    """``x @ W.T + bias`` via the HIP INT4/INT6 decode feeding the WMMA INT8 GEMM.
 
     The weight is decoded a column chunk at a time so a chunk is still cached when
     the GEMM reads it back, instead of the whole [N, K] INT8 weight round-tripping
@@ -1166,11 +1233,11 @@ def w4a8_int8_linear(
     packed weight itself, so a few rows take a GEMV that dequantizes in registers
     and never writes the INT8 weight at all.
     """
-    validate_w4a8_operands(
+    _n, k, _bits = validate_w4a8_operands(
         qdata, s_rel, s_channel, codebook, correction, group_size, convrot_groupsize
     )
-    if x.shape[-1] != qdata.shape[-1] * 2:
-        raise ValueError(f"Input K={x.shape[-1]} does not match qdata K={qdata.shape[-1] * 2}")
+    if x.shape[-1] != k:
+        raise ValueError(f"Input K={x.shape[-1]} does not match qdata K={k}")
 
     # The asymmetric zero-point correction is a rank-one term the INT8 epilogue
     # cannot express, so that layout runs off the dequantized weight instead.
@@ -3031,6 +3098,31 @@ def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):
     return buffers, anchor_indices
 
 
+def _sage_can_fuse_dense_mask(attn_mask: torch.Tensor | None) -> bool:
+    return (
+        attn_mask is not None
+        and attn_mask.ndim == 4
+        and attn_mask.dtype in (torch.float16, torch.bfloat16)
+        and 1 < attn_mask.shape[2] <= 256
+        and 64 < attn_mask.shape[3] <= 2048
+        and attn_mask.stride(2) != 0
+    )
+
+
+def _sage_dense_mask_buffer(attn_mask: torch.Tensor) -> torch.Tensor:
+    return torch.empty(
+        (
+            1 if attn_mask.stride(0) == 0 else attn_mask.shape[0],
+            1 if attn_mask.stride(1) == 0 else attn_mask.shape[1],
+            (attn_mask.shape[2] + 15) // 16,
+            (attn_mask.shape[3] + 63) // 64,
+            32 if attn_mask.dtype == torch.bool else 1024,
+        ),
+        dtype=torch.int32 if attn_mask.dtype == torch.bool else attn_mask.dtype,
+        device=attn_mask.device,
+    )
+
+
 def sage_int8_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3049,6 +3141,10 @@ def sage_int8_sdpa(
 
     cta_k = _sage_cta_k(head_dim, k.shape[2], attn_mask is not None)
     buffers, anchor_indices = _sage_buffers(q, k, cta_k)
+    raw_dense_mask = None
+    if head_dim <= 128 and _sage_can_fuse_dense_mask(attn_mask):
+        raw_dense_mask = attn_mask
+        attn_mask = _sage_dense_mask_buffer(raw_dense_mask)
     _C.sage_sdpa(
         _dl(q),
         _dl(k),
@@ -3067,6 +3163,7 @@ def sage_int8_sdpa(
         DTYPE_TO_CODE[output_dtype],
         _stream(q),
         None if attn_mask is None else _dl(attn_mask),
+        None if raw_dense_mask is None else _dl(raw_dense_mask),
     )
     return output
 

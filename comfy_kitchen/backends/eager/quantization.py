@@ -6,6 +6,8 @@
 #   Copyright (c) Meta Platforms, Inc. and affiliates.
 #   Licensed under the BSD 3-Clause License (see NOTICE file for details)
 
+from threading import Lock
+
 import torch
 
 from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
@@ -170,6 +172,30 @@ E2M1_LUT = torch.tensor([
 ]).unsqueeze(1)
 
 E2M1_LUT_CACHE = {}
+_E2M1_LUT_CACHE_LOCK = Lock()
+
+
+def clear_nvfp4_lut_cache(device_index: int) -> int:
+    """Release cached eager NVFP4 lookup tables for one XPU device.
+
+    Call only after work using the device has stopped. Synchronization completes
+    pending uses of the tables before their cache references are removed.
+    Returns the number of removed tables. A later dequantization rebuilds them.
+    """
+    if isinstance(device_index, bool) or not isinstance(device_index, int) or device_index < 0:
+        raise ValueError("device_index must be a nonnegative integer")
+
+    with _E2M1_LUT_CACHE_LOCK:
+        keys = [
+            key for key in E2M1_LUT_CACHE
+            if key[0].type == "xpu" and key[0].index == device_index
+        ]
+        if not keys:
+            return 0
+        torch.xpu.synchronize(device_index)
+        for key in keys:
+            E2M1_LUT_CACHE.pop(key)
+        return len(keys)
 
 
 def dequantize_nvfp4(
@@ -179,10 +205,11 @@ def dequantize_nvfp4(
     output_type: torch.dtype = torch.bfloat16,
     hi_first: bool = True,
 ) -> torch.Tensor:
-    lut = E2M1_LUT_CACHE.get((qx.device, output_type))
-    if lut is None:
-        lut = E2M1_LUT.to(qx.device, output_type)
-        E2M1_LUT_CACHE[(qx.device, output_type)] = lut
+    with _E2M1_LUT_CACHE_LOCK:
+        lut = E2M1_LUT_CACHE.get((qx.device, output_type))
+        if lut is None:
+            lut = E2M1_LUT.to(qx.device, output_type)
+            E2M1_LUT_CACHE[(qx.device, output_type)] = lut
 
     lo = qx & 0x0F
     hi = qx >> 4

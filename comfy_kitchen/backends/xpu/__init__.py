@@ -13,6 +13,9 @@ from comfy_kitchen.constraints import (
 )
 from comfy_kitchen.registry import registry
 
+from .w4a8_int8 import native_call_rule as _w4a8_native_call_rule
+from .w4a8_int8 import w4a8_int8_linear
+
 __all__ = [
     "sol_attn",
     "sol_attn_chunked",
@@ -64,6 +67,7 @@ __all__ = [
     "fp16_conv3d",
     "fp16_conv3d_out",
     "gemv_awq_w4a16",
+    "w4a8_int8_linear",
 ]
 
 _AVAILABLE = False
@@ -810,6 +814,26 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
     }
     if not _INT8_AVAILABLE:
         capabilities.clear()
+    elif hasattr(_native_int8, "int8_linear_prequantized"):
+        capabilities["w4a8_int8_linear"] = FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=frozenset({torch.float16, torch.bfloat16})),
+                "qdata": int8_2d,
+                "s_rel": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float8_e4m3fn}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "s_channel": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(1),)),
+                "codebook": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(1),)),
+                "correction": ParamConstraint(dtypes=floats),
+                "bias": ParamConstraint(dtypes=floats),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "out_dtype": ParamConstraint(dtypes=floats),
+            },
+            default_devices=xpu,
+            call_rules=(_w4a8_native_call_rule,),
+        )
     if _SVDQ_AVAILABLE:
         capabilities.update(
             {

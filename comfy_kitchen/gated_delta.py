@@ -8,6 +8,10 @@ else:
     _hip_backend = None
 
 _MAX_STEPS = 8
+# Published wheels compile 75-virtual as the floor (see setup.py). Volta
+# (sm_70) still reports enough opt-in shared memory for the fused decode
+# budget, so the shmem check alone waves V100 through to a rejected launch.
+_NATIVE_MINIMUM_CAPABILITY = (7, 5)
 _device_optin: dict[int, int] = {}
 
 
@@ -33,7 +37,7 @@ def _fused_shmem_bytes(key_head_dim: int, value_head_dim: int) -> int:
     return (key_head_dim * value_head_dim + 2 * _MAX_STEPS * key_head_dim + 4 * _MAX_STEPS * warps) * 4
 
 
-def is_available(device: torch.device | int | None = None, key_head_dim: int = 128, value_head_dim: int = 128) -> bool:
+def is_available(device: torch.device | None = None, key_head_dim: int = 128, value_head_dim: int = 128) -> bool:
     """Return whether the fused DeltaNet decode kernels can run on this device for these head dims."""
     if device is not None and not isinstance(device, int):
         requested_device = torch.device(device)
@@ -53,8 +57,6 @@ def is_available(device: torch.device | int | None = None, key_head_dim: int = 1
         # flash_attention.py asks it to: its arch gate is the intersection over
         # every visible device. It sizes its own shared memory, so there is no
         # opt-in budget to check.
-        if device is not None and torch.device(device).type != "cuda":
-            return False
         return _hip_backend.gated_delta_decode_is_available(key_head_dim, value_head_dim)
     cuda_backend = _get_cuda_backend()
     ext = cuda_backend._C if cuda_backend is not None and cuda_backend._EXT_AVAILABLE else None
@@ -62,12 +64,9 @@ def is_available(device: torch.device | int | None = None, key_head_dim: int = 1
         return False
     if key_head_dim != 128 or value_head_dim % 32 != 0 or not 0 < value_head_dim <= 512:
         return False
-    index = None
-    if device is not None:
-        device = torch.device(device)
-        if device.type != "cuda":
-            return False
-        index = device.index
+    if torch.cuda.get_device_capability(device) < _NATIVE_MINIMUM_CAPABILITY:
+        return False
+    index = device.index if device is not None else None
     if index is None:
         index = torch.cuda.current_device()
     optin = _device_optin.get(index)
