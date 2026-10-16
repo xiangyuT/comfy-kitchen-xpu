@@ -283,7 +283,11 @@ def test_flash_attention_decode_rejects_invalid_dimensions(q_dim, k_dim, v_dim):
 # everywhere: the native kernel for BF16 head_dim 256 where one is built, torch otherwise.
 # The reference tests run on the GPU when there is one (native for bf16/256, torch for the
 # other operands) and on the CPU otherwise.
-GQA_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+GQA_DEVICE = (
+    "cuda" if torch.cuda.is_available()
+    else "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available()
+    else "cpu"
+)
 GQA_OPERANDS = [(torch.bfloat16, 256), (torch.float32, 256), (torch.bfloat16, 128)]
 
 

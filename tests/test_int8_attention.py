@@ -1117,20 +1117,24 @@ def test_hip_attention_rejects_invalid_prepared_mask(invalid):
         )
 
 
-@requires_int8_attention
+@pytest.mark.parametrize("device", ["cuda", "xpu"])
 @pytest.mark.parametrize("seq", [1, 6, 7])
 @pytest.mark.parametrize("circular", [False, True])
-def test_int8_decode_graph_growing_prefix_and_rollback(seq, circular):
-    from comfy_kitchen.int8_decode import Int8DecodeCache
+def test_int8_decode_graph_growing_prefix_and_rollback(seq, circular, device):
+    from comfy_kitchen.int8_decode import Int8DecodeCache, is_available
+
+    if not is_available(torch.device(device)):
+        pytest.skip(f"requires the {device} INT8 decode backend")
+    accelerator = getattr(torch, device)
 
     torch.manual_seed(127)
     batch, heads, kv_heads, capacity = 2, 24, 4, 3079
-    q = torch.randn(batch, heads, seq, 256, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(batch, kv_heads, capacity, 256, device="cuda", dtype=q.dtype)
+    q = torch.randn(batch, heads, seq, 256, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch, kv_heads, capacity, 256, device=device, dtype=q.dtype)
     v = torch.randn_like(k)
     v[:, :, :512].add_(0.5)
     cache = Int8DecodeCache(batch, kv_heads, capacity, q.device)
-    length = torch.zeros(1, device="cuda", dtype=torch.int64)
+    length = torch.zeros(1, device=device, dtype=torch.int64)
     out, lse = cache.attend(q, length)
     assert (out == 0).all() and torch.isneginf(lse).all()
 
@@ -1139,8 +1143,8 @@ def test_int8_decode_graph_growing_prefix_and_rollback(seq, circular):
     source_k = k[:, :, :1536].contiguous() if circular else k
     source_v = v[:, :, :1536].contiguous() if circular else v
     reference = Int8DecodeCache(batch, kv_heads, capacity, q.device)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    graph = accelerator.CUDAGraph() if device == "cuda" else accelerator.XPUGraph()
+    with accelerator.graph(graph):
         cache.update(source_k, source_v, length)
         out, lse = cache.attend(q, length)
     previous = 1021

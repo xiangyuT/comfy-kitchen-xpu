@@ -1,28 +1,64 @@
-"""Optional Triton decode routes; no vLLM extension or serving ABI dependency."""
+"""Kitchen decode adapters for Omni's native SYCL core."""
 
 import torch
 
 from comfy_kitchen.registry import registry
 
 
-def is_available(device, dtype=torch.bfloat16):
+@torch.compiler.assume_constant_result
+def _device_count():
+    # XPU topology is fixed after runtime initialization. Keep only this
+    # non-Tensor hardware query constant; backend overrides remain observable.
+    return torch.xpu.device_count()
+
+
+def _device_available(device):
     if device is None or isinstance(device, int):
         return False
     device = torch.device(device)
-    if device.type != "xpu" or dtype != torch.bfloat16:
+    if device.type != "xpu":
         return False
-    if not registry.is_available("triton") or not torch.xpu.is_available():
+    if not registry.is_available("xpu") or not torch.xpu.is_available():
         return False
-    if registry.get_backend_override() not in (None, "triton"):
+    if registry.get_backend_override() not in (None, "xpu"):
         return False
-    return device.index is None or 0 <= device.index < torch.xpu.device_count()
+    if device.index is not None and not 0 <= device.index < _device_count():
+        return False
+    return True
+
+
+def is_available(device, dtype=torch.bfloat16):
+    if dtype != torch.bfloat16 or not _device_available(device):
+        return False
+    try:
+        from omni_xpu_kernel import kitchen
+        return kitchen.supports_decode_attention()
+    except (ImportError, AttributeError):
+        return False
+
+
+def int8_is_available(device):
+    if not _device_available(device):
+        return False
+    try:
+        from omni_xpu_kernel import kitchen
+        return kitchen.supports_int8_decode()
+    except (ImportError, AttributeError):
+        return False
 
 
 def gqa(q, k, v, lengths):
-    from comfy_kitchen.backends.triton.decode import decode
+    from omni_xpu_kernel import kitchen
 
     _validate(q, k, v, lengths)
-    return decode(q, k, v, lengths)[0]
+    return kitchen.decode_attention(q, k, v, lengths)[0]
+
+
+def step_merge(out, lse, q, k, v, merged):
+    from omni_xpu_kernel import kitchen
+    _validate(q, k, v)
+    kitchen.decode_step_merge(out, lse, q, k, v, merged)
+    return merged
 
 
 def _validate(q, k, v, lengths=None):

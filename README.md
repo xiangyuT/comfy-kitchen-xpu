@@ -144,11 +144,11 @@ numeric limits.
 | `dequantize_gguf` | ✓ |
 | `prequantize_int8_attention` | |
 | `int8_attention_from_prequantized` | |
-| `flash_attention_decode` | |
-| `flash_attention_decode_gqa` | |
-| `flash_attention_decode_step_merge` | |
-| `gated_delta_decode_deferred` | |
-| `deltanet_conv_step_deferred` | |
+| `flash_attention_decode` | ✓ |
+| `flash_attention_decode_gqa` | ✓ |
+| `flash_attention_decode_step_merge` | ✓ |
+| `gated_delta_decode_deferred` | ✓ |
+| `deltanet_conv_step_deferred` | ✓ |
 | `quantize_w4a8_int8_weight` | |
 | `dequantize_w4a8_int8_weight` | |
 | `w4a8_int8_linear` | ✓ |
@@ -157,10 +157,9 @@ The eight RoPE functions also have in-place forms with the same XPU coverage.
 
 The `zero_pad`/`out`/strided-view forms for Conv3D and GroupNorm remain
 available. W4A8 and W6A8 use the upstream packed layout and quantization
-contract. Flash decode has no native companion implementation; an optional
-Triton route is described below. Runtime capability
-detection is the authority for the installed companion wheel:
-`ck.list_backends()["xpu"]["capabilities"]`.
+contract. Native capabilities depend on the installed companion wheel.
+Use `ck.list_backends()["xpu"]["capabilities"]` for registry operators and the
+decode APIs' `is_available` functions for their separate native entry points.
 
 ### Decode APIs
 
@@ -169,22 +168,25 @@ scaled-residual arguments. W4A8/W6A8 keep the native XPU INT8 GEMM with eager
 activation/epilogue preparation. CUDA's resident MMA weight records are unpacked
 to canonical storage when moved to XPU or CPU; XPU does not produce that layout.
 
-The experimental BF16, head-dimension-256 XPU decode routes use Triton for
-GQA, current-step merging, and the growing INT8 KV cache. They require the
-Triton backend to be enabled and respect an explicit eager override. ComfyUI
-normally disables Kitchen Triton on XPU, so these routes are unavailable in
-that default configuration. They do not add native `omni_xpu_kernel` capabilities.
-The legacy single-query Flash decode API also accepts head dimension 128.
+BF16 GQA decode, current-step merging, and the growing INT8 KV cache use native
+SYCL entry points in `omni_xpu_kernel`. They work with Kitchen Triton disabled
+and respect an explicit eager override. GQA and step merge accept head dimension
+256 and up to eight query rows; legacy single-query decode also accepts 128.
+Older companion wheels retain the upstream Torch fallback where available.
 
 The XPU INT8 cache retains 512-token pages and device-resident lengths. Its
-runtime-only codec uses per-row key scales and per-page/channel value scales;
-queries remain BF16. Cache storage is specific to its backend and is not a
-portable CUDA/HIP cache format. Incremental updates retain the last two pages,
-including when a speculative suffix is rejected.
+codec preserves upstream Q/K H128 rotation and signed INT8 per-thread scale
+groups, plus per-page/channel value scales. BF16 queries are quantized before
+attention. XPU stores values without CUDA's MMA permutation, so cache bytes are
+specific to their backend. Incremental updates retain the last two pages,
+including when a speculative suffix is rejected; circular sources retain both
+pages. The cache supports head dimension 256 and `(H / Hk) * S <= 64`.
 
-Deferred DeltaNet convolution/decode uses upstream Torch operations on XPU.
-Its native-availability query remains false. These implementations preserve
-the accepted-prefix/parity protocol without transferring execution to CPU.
+Deferred DeltaNet convolution/decode has native SYCL support for DK=DV=128.
+It commits the previous accepted prefix and verifies the current chain through
+device-resident parity and side buffers, retaining FP32 recurrent state. The
+upstream Torch path remains available for unsupported head dimensions or an
+older companion wheel.
 
 ## XPU backend behavior
 

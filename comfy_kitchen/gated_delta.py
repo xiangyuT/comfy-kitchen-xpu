@@ -85,6 +85,15 @@ def deferred_is_available(device: torch.device | int | None = None, key_head_dim
     """Return whether deltanet_conv_step_deferred and gated_delta_decode_deferred run their
     native kernels on this device: DK = DV = 128 on CUDA sm_80+ or on the HIP extension's
     supported GPUs. They otherwise compute the same result in torch."""
+    if device is not None and not isinstance(device, int) and torch.device(device).type == "xpu":
+        from .backends.xpu.decode import _device_available
+        if key_head_dim != 128 or value_head_dim != 128 or not _device_available(device):
+            return False
+        try:
+            from omni_xpu_kernel import kitchen
+            return kitchen.supports_gated_delta_deferred()
+        except (ImportError, AttributeError):
+            return False
     if not torch.cuda.is_available():
         return False
     if device is not None and not isinstance(device, int) and torch.device(device).type != "cuda":
@@ -131,6 +140,10 @@ def deltanet_conv_step_deferred(
     conv_w = conv_w.reshape(channels, -1).contiguous()
     if not deferred_is_available(proj.device):
         _conv_deferred_torch(proj, conv_state, conv_w, conv_b, proj_buf, qkv_buf, ctl)
+        return
+    if proj.device.type == "xpu":
+        from omni_xpu_kernel import kitchen
+        kitchen.deltanet_conv_deferred(proj, conv_state, conv_w, conv_b, proj_buf, qkv_buf, ctl)
         return
     if _hip_backend is not None:
         ok = _hip_backend.deltanet_conv_deferred(
@@ -210,6 +223,10 @@ def gated_delta_decode_deferred(
     if not deferred_is_available(x.device, key_dim_head, value_dim):
         return _decode_deferred_torch(x, w_a, w_b, dt_bias, g_decay, state, key_dim, num_key_heads, scale,
                                       z, norm_weight, eps, qkv_buf, gates_buf, sumsq_buf, ctl)
+    if x.device.type == "xpu":
+        from omni_xpu_kernel import kitchen
+        return kitchen.gated_delta_decode_deferred(x, w_a, w_b, dt_bias, g_decay, state,
+            key_dim, num_key_heads, scale, z, norm_weight, eps, qkv_buf, gates_buf, sumsq_buf, ctl)
     out = torch.empty((batch, seq, heads, value_dim), dtype=x.dtype, device=x.device)
     if _hip_backend is not None:
         ok = _hip_backend.gated_delta_decode_deferred(

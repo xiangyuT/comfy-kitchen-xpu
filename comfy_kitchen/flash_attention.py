@@ -262,11 +262,7 @@ def flash_attention_decode_step_merge(
     if q.shape[-1] != 256 or not flash_attention_decode_gqa_is_available(q.device, q.dtype):
         return _step_merge_torch(out, lse, q, k, v, merged)
     if q.device.type == "xpu":
-        from .backends.xpu.decode import _validate
-        from .backends.triton.decode import step_merge
-        _validate(q, k, v)
-        if k.shape[2] != q.shape[2]:
-            raise ValueError("step merge requires one key/value row per query row")
+        from .backends.xpu.decode import step_merge
         return step_merge(out, lse, q, k, v, merged)
     if _hip_backend is not None:
         _hip_backend.flash_decode_step_merge(out, lse, q, k, v, merged)

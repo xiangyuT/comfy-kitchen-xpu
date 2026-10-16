@@ -26,7 +26,7 @@ def _get_backend():
 def is_available(device: torch.device | None = None) -> bool:
     """Return whether the native growing INT8 cache supports this device."""
     if device is not None and torch.device(device).type == "xpu":
-        from .backends.xpu.decode import is_available as xpu_decode_available
+        from .backends.xpu.decode import int8_is_available as xpu_decode_available
         return xpu_decode_available(device)
     if device is not None and torch.device(device).type != "cuda":
         return False
@@ -44,7 +44,7 @@ def is_available(device: torch.device | None = None) -> bool:
 class Int8DecodeCache:
     def __init__(self, batch, heads, capacity, device):
         if not is_available(device):
-            raise RuntimeError("Int8DecodeCache requires an available CUDA/HIP extension or XPU Triton backend")
+            raise RuntimeError("Int8DecodeCache requires an available native CUDA/HIP or XPU backend")
         if batch <= 0 or heads <= 0 or capacity <= 0:
             raise ValueError("cache batch, heads and capacity must be positive")
         self._xpu = torch.device(device).type == "xpu"
@@ -53,9 +53,9 @@ class Int8DecodeCache:
         pages = (capacity + page_size - 1) // page_size
         self.key = torch.zeros((batch, pages, heads, page_size, 256), dtype=torch.int8, device=device)
         self.value = torch.empty((batch, pages, heads, 256, page_size), dtype=torch.int8, device=device)
-        # XPU uses per-row keys and per-page/channel values. The cache is
-        # runtime-only; its backend-specific scales are never serialized.
-        scale_rows = page_size if self._xpu else page_size // 64 * 4
+        # Preserve per-thread Q/K groups. XPU stores V without CUDA's MMA
+        # permutation; this runtime cache is never serialized across backends.
+        scale_rows = page_size // 64 * 4
         self.key_scale = torch.empty((batch, pages, heads, scale_rows), dtype=torch.float32, device=device)
         self.value_scale = torch.empty((batch, pages, heads, 256), dtype=torch.float32, device=device)
 
@@ -78,8 +78,9 @@ class Int8DecodeCache:
             rows = key.shape[2]
             if rows > self._capacity or (not initialize and rows != self._capacity and rows % 512):
                 raise ValueError("INT8 cache sources must fit capacity; circular updates require page-aligned rows")
-            from .backends.triton.decode import update_cache
-            update_cache(self, key, value, length, initialize)
+            from omni_xpu_kernel import kitchen
+            kitchen.int8_decode_update(key, value, self.key, self.value,
+                self.key_scale, self.value_scale, length, self._capacity, initialize)
             return
         backend._C._int8_decode_update(
             *map(wrap_for_dlpack, (key, value, self.key, self.value, self.key_scale, self.value_scale, length)),
@@ -99,9 +100,9 @@ class Int8DecodeCache:
                 raise ValueError("INT8 cache requires nonempty query and H divisible by Hk")
             if query.device != self.key.device or query.dtype != torch.bfloat16:
                 raise ValueError("INT8 cache query must be BF16 on the cache device")
-            from .backends.triton.decode import decode
-            return decode(query, self.key, self.value, length, key_scale=self.key_scale,
-                          value_scale=self.value_scale, capacity=self._capacity)
+            from omni_xpu_kernel import kitchen
+            return kitchen.int8_decode(query, self.key, self.value,
+                self.key_scale, self.value_scale, length, self._capacity)
         batch, heads, seq, dim = query.shape
         kv_heads = self.key.shape[2]
         rows = heads // kv_heads * seq
