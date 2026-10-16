@@ -57,6 +57,7 @@ __all__ = [
     "int8_linear",
     "mm_int8",
     "w4a8_int8_linear",
+    "w4a8_packed_linear",
 ]
 
 import torch
@@ -68,6 +69,7 @@ from comfy_kitchen.constraints import (
     na3d_common_call_rule,
     sol_attn_common_call_rule,
     with_out_param,
+    with_w4a8_packed_storage,
 )
 from comfy_kitchen.registry import registry
 
@@ -132,6 +134,7 @@ from .w4a8_int8 import (
     dequantize_w4a8_int8_weight,
     quantize_w4a8_int8_weight,
     w4a8_int8_linear,
+    w4a8_packed_linear,
 )
 
 
@@ -702,6 +705,7 @@ def _build_constraints() -> dict:
     )
     out["fp16_conv3d_out"] = with_out_param(out["fp16_conv3d"])
     out["group_norm_silu_pad3d_out"] = with_out_param(out["group_norm_silu_pad3d"])
+    out["w4a8_packed_linear"] = with_w4a8_packed_storage(out["w4a8_int8_linear"])
     return out
 
 

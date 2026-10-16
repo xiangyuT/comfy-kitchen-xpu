@@ -46,8 +46,11 @@ the upstream maintainers and contributors for the library architecture,
 operator APIs, QuantizedTensor design, backend registry, eager/CUDA/Triton
 implementations, packaging, and tests on which this work is built.
 
-The XPU development line is based on upstream Comfy Kitchen `0.2.37` at
-[`be003b7`](https://github.com/Comfy-Org/comfy-kitchen/commit/be003b7c23c5b01328657955b8bc5d3f073d868e).
+The XPU development line includes upstream Comfy Kitchen `0.2.37` and later
+changes through
+[`b614102f8f0fcbba00d7fe570c31eeeda4f0061d`](https://github.com/Comfy-Org/comfy-kitchen/commit/b614102f8f0fcbba00d7fe570c31eeeda4f0061d).
+Upstream still identifies that source as `0.2.37`; it differs from the
+[`v0.2.37` release tag](https://github.com/Comfy-Org/comfy-kitchen/commit/be003b7c23c5b01328657955b8bc5d3f073d868e).
 The Intel-specific work in this fork is intentionally optional: importing
 Comfy Kitchen remains safe when PyTorch XPU, `omni_xpu_kernel`, its native
 extension, or Intel GPU hardware is absent.
@@ -142,6 +145,10 @@ numeric limits.
 | `prequantize_int8_attention` | |
 | `int8_attention_from_prequantized` | |
 | `flash_attention_decode` | |
+| `flash_attention_decode_gqa` | |
+| `flash_attention_decode_step_merge` | |
+| `gated_delta_decode_deferred` | |
+| `deltanet_conv_step_deferred` | |
 | `quantize_w4a8_int8_weight` | |
 | `dequantize_w4a8_int8_weight` | |
 | `w4a8_int8_linear` | ✓ |
@@ -150,9 +157,34 @@ The eight RoPE functions also have in-place forms with the same XPU coverage.
 
 The `zero_pad`/`out`/strided-view forms for Conv3D and GroupNorm remain
 available. W4A8 and W6A8 use the upstream packed layout and quantization
-contract; Flash decode remains unavailable on XPU. Runtime capability
+contract. Flash decode has no native companion implementation; an optional
+Triton route is described below. Runtime capability
 detection is the authority for the installed companion wheel:
 `ck.list_backends()["xpu"]["capabilities"]`.
+
+### Decode APIs
+
+`QuantizedTensor.linear_input_act` accepts the upstream input activation and
+scaled-residual arguments. W4A8/W6A8 keep the native XPU INT8 GEMM with eager
+activation/epilogue preparation. CUDA's resident MMA weight records are unpacked
+to canonical storage when moved to XPU or CPU; XPU does not produce that layout.
+
+The experimental BF16, head-dimension-256 XPU decode routes use Triton for
+GQA, current-step merging, and the growing INT8 KV cache. They require the
+Triton backend to be enabled and respect an explicit eager override. ComfyUI
+normally disables Kitchen Triton on XPU, so these routes are unavailable in
+that default configuration. They do not add native `omni_xpu_kernel` capabilities.
+The legacy single-query Flash decode API also accepts head dimension 128.
+
+The XPU INT8 cache retains 512-token pages and device-resident lengths. Its
+runtime-only codec uses per-row key scales and per-page/channel value scales;
+queries remain BF16. Cache storage is specific to its backend and is not a
+portable CUDA/HIP cache format. Incremental updates retain the last two pages,
+including when a speculative suffix is rejected.
+
+Deferred DeltaNet convolution/decode uses upstream Torch operations on XPU.
+Its native-availability query remains false. These implementations preserve
+the accepted-prefix/parity protocol without transferring execution to CPU.
 
 ## XPU backend behavior
 
