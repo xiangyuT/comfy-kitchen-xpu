@@ -21,7 +21,7 @@ from comfy_kitchen.tensor.w4a8_packed import (
 
 
 @pytest.mark.parametrize("bits", [4, 6])
-@pytest.mark.parametrize("activation", [None, "swiglu", "rms_norm"])
+@pytest.mark.parametrize("activation", [None, "swiglu", "situ", "rms_norm"])
 @pytest.mark.parametrize("with_residual", [False, True])
 def test_new_linear_keywords_keep_native_gemm(bits, activation, with_residual, monkeypatch):
     calls = []
@@ -42,7 +42,7 @@ def test_new_linear_keywords_keep_native_gemm(bits, activation, with_residual, m
         weight, bits=bits, scale_dtype=torch.float32, scale_search=False,
     )
     assert correction is None
-    raw_x = torch.randn(2, 3, 512 if activation == "swiglu" else 256, dtype=weight.dtype)
+    raw_x = torch.randn(2, 3, 512 if activation in ("swiglu", "situ") else 256, dtype=weight.dtype)
     original = raw_x.clone()
     norm = torch.rand(256, dtype=weight.dtype)
     bias = torch.randn(32, dtype=weight.dtype)

@@ -46,11 +46,8 @@ the upstream maintainers and contributors for the library architecture,
 operator APIs, QuantizedTensor design, backend registry, eager/CUDA/Triton
 implementations, packaging, and tests on which this work is built.
 
-The XPU development line includes upstream Comfy Kitchen `0.2.37` and later
-changes through
-[`b614102f8f0fcbba00d7fe570c31eeeda4f0061d`](https://github.com/Comfy-Org/comfy-kitchen/commit/b614102f8f0fcbba00d7fe570c31eeeda4f0061d).
-Upstream still identifies that source as `0.2.37`; it differs from the
-[`v0.2.37` release tag](https://github.com/Comfy-Org/comfy-kitchen/commit/be003b7c23c5b01328657955b8bc5d3f073d868e).
+The XPU development line includes upstream Comfy Kitchen `0.2.39` at
+[`e40e76d9c544b3f74c3b9ea923f7bc3d45a96372`](https://github.com/Comfy-Org/comfy-kitchen/commit/e40e76d9c544b3f74c3b9ea923f7bc3d45a96372).
 The Intel-specific work in this fork is intentionally optional: importing
 Comfy Kitchen remains safe when PyTorch XPU, `omni_xpu_kernel`, its native
 extension, or Intel GPU hardware is absent.
@@ -89,7 +86,7 @@ available in the installed companion wheel.
 ## XPU support matrix
 
 This matrix follows the [upstream per-function format](https://github.com/Comfy-Org/comfy-kitchen#backend-capabilities-matrix)
-for the fork's `0.2.37` API and matching `omni_xpu_kernel` companion package.
+for the fork's `0.2.39` API and matching `omni_xpu_kernel` companion package.
 ✓ means the fork has a native XPU route when the matching companion symbol is
 present; an empty cell means it does not. Triton or PyTorch eager fallbacks do
 not count as XPU backend support. A ✓ may still have dtype, shape, layout, or
@@ -160,6 +157,15 @@ available. W4A8 and W6A8 use the upstream packed layout and quantization
 contract. Native capabilities depend on the installed companion wheel.
 Use `ck.list_backends()["xpu"]["capabilities"]` for registry operators and the
 decode APIs' `is_available` functions for their separate native entry points.
+
+### SiTU activation
+
+`input_act="situ"` consumes `[hidden | gate]` halves and halves the input width.
+A matching companion provides native SiTU, optional ConvRot and INT8 quantization
+for BF16/FP16 inputs with activated width up to 8192 and ConvRot groups 64/256.
+This path is shared by INT8 and W4A8/W6A8 linear. Wider inputs and older companion
+wheels use the device-side Torch activation preparation before the existing
+native INT8 GEMM. Backend overrides continue to apply.
 
 ### Decode APIs
 
@@ -257,7 +263,7 @@ git clone https://github.com/xiangyuT/comfy-kitchen-xpu.git
 cd comfy-kitchen-xpu
 python -m pip install build
 python -m build --wheel
-pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.37-py3-none-any.whl
+pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.39-py3-none-any.whl
 ```
 
 The repository retains upstream CUDA source to keep future upstream updates
