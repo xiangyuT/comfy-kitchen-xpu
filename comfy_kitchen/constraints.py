@@ -17,6 +17,7 @@ __all__ = [
     "ValidationResult",
     "validate_function_call",
     "validate_param",
+    "with_w4a8_packed_storage",
 ]
 
 
@@ -357,3 +358,11 @@ def na3d_common_call_rule(kwargs):
             "kernel_size", f"entries must be positive, got {list(kernel_size)}"
         )
     return ValidationResult.ok()
+
+
+def with_w4a8_packed_storage(base: FunctionConstraints) -> FunctionConstraints:
+    """Packed linear uses 1D records and empty scales instead of canonical 2D storage."""
+    params = dict(base.params)
+    for name in ("qdata", "s_rel"):
+        params[name] = replace(params[name], shape_rules=(ExactDims(1),))
+    return replace(base, params=params)
