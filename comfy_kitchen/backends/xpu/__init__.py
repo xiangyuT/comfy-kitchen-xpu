@@ -7,6 +7,7 @@ import sys
 import torch
 
 from comfy_kitchen.allocation import allocation_context
+from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
 from comfy_kitchen.constraints import (
     ExactDims, FunctionConstraints, ParamConstraint, sol_attn_common_call_rule,
     with_out_param,
@@ -95,6 +96,7 @@ _AWQ_W4A16_AVAILABLE = False
 _RMS_NORM_FOR_INT8_AVAILABLE = False
 _RMS_NORM_QUANTIZE_AVAILABLE = False
 _RMS_NORM_CONVROT_QUANT_AVAILABLE = False
+_GATED_QUANTIZE_AVAILABLE = False
 _SCALED_RESIDUAL_AVAILABLE = False
 _FUSED_RESIDUAL_AVAILABLE = False
 
@@ -270,6 +272,10 @@ try:
             _native_kitchen is not None
             and hasattr(_native_kitchen, "rms_norm_convrot_quantize_int8")
         )
+        _GATED_QUANTIZE_AVAILABLE = (
+            _native_kitchen is not None
+            and hasattr(_native_kitchen, "gated_quantize_int8")
+        )
         _SCALED_RESIDUAL_AVAILABLE = (
             _native_kitchen is not None
             and hasattr(_native_kitchen, "scaled_residual")
@@ -394,7 +400,7 @@ if _AVAILABLE:
             torch.float16,
             torch.bfloat16,
         )
-        _INT8_LINEAR_INPUT_ACTS = (None, "none", "gelu_tanh", "swiglu")
+        _INT8_LINEAR_INPUT_ACTS = (None, "none", "gelu_tanh", "swiglu", "situ")
 
         @torch.library.custom_op(
             "comfy_kitchen_xpu::int8_linear",
@@ -513,6 +519,11 @@ if _AVAILABLE:
             residual_scale: torch.Tensor | None = None,
         ) -> torch.Tensor:
             prepared = None
+            if input_act == "situ" and not _GATED_QUANTIZE_AVAILABLE:
+                # An older companion still supplies the INT8 GEMM. Prepare the
+                # new activation here rather than passing it an unknown code.
+                x = _apply_input_act(x, input_act)
+                input_act = None
             if input_act == "rms_norm":
                 if input_act_weight is None:
                     raise ValueError("input_act 'rms_norm' requires input_act_weight")
