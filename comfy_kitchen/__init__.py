@@ -172,6 +172,7 @@ __all__ = [
     "to_blocked",
     "from_blocked",
     "set_allocation_context",
+    "memmove",
     # Backend configuration
     "list_backends",
     "set_backend_priority",
@@ -320,6 +321,13 @@ def sol_attn_is_available(device: torch.device | int | None = None) -> bool:
                 and registry.get_constraints("xpu", "sol_attn") is not None)
     except (TypeError, ValueError, RuntimeError):
         return False
+
+
+def memmove(dst: torch.Tensor, src: torch.Tensor):
+    """Copy src's bytes into dst in place; the two ranges may overlap."""
+    if dst.device.type == "cuda" and getattr(torch.version, "hip", None) and registry.is_available("hip"):
+        return _hip_backend.memmove_(dst, src)
+    dst.copy_(src.clone())
 
 
 def na3d(
