@@ -41,6 +41,9 @@ if "--no-hip" in sys.argv:
     BUILD_NO_HIP = True
     sys.argv.remove("--no-hip")
 
+# SYCL is opt-in so installing a compiler does not change existing CUDA/HIP builds.
+BUILD_XPU = os.getenv("COMFY_KITCHEN_BUILD_XPU") == "1"
+
 # build_ext parses --hip-archs itself, but the extension list is built before its
 # options are finalized, so the value has to be read here too. Left in argv for it.
 HIP_ARCHS_CLI = ""
@@ -146,7 +149,12 @@ class CMakeBuildExt(build_ext):
             f"-DCOMFY_ENABLE_LINEINFO={'ON' if enable_lineinfo else 'OFF'}",
         ]
 
-        if ext.backend == "hip":
+        if ext.backend == "xpu":
+            compiler = get_sycl_compiler()
+            if compiler is None:
+                raise RuntimeError("XPU build requested, but icpx was not found")
+            cmake_args.extend(["-G", "Ninja", f"-DCMAKE_CXX_COMPILER={cmake_path(compiler)}"])
+        elif ext.backend == "hip":
             # CMake's default generator on Windows is Visual Studio, which does
             # not support the HIP language.
             cmake_args.extend(["-G", "Ninja"])
@@ -687,6 +695,24 @@ def setup_cuda_extension() -> CMakeExtension | None:
     return ext_module
 
 
+def get_sycl_compiler() -> str | None:
+    """Use an explicit SYCL driver or icpx from the oneAPI environment."""
+    return shutil.which(os.getenv("COMFY_SYCL_CXX", "icpx"))
+
+
+def setup_xpu_extension() -> CMakeExtension:
+    if get_sycl_compiler() is None:
+        raise RuntimeError(
+            "COMFY_KITCHEN_BUILD_XPU=1 requires the oneAPI icpx compiler. "
+            "Initialize the oneAPI environment or set COMFY_SYCL_CXX."
+        )
+    return CMakeExtension(
+        "comfy_kitchen.backends.xpu._C",
+        str(pathlib.Path(__file__).resolve().parent / "comfy_kitchen/backends/xpu"),
+        backend="xpu",
+    )
+
+
 def get_extensions() -> list[setuptools.Extension]:
     extensions = []
 
@@ -699,9 +725,9 @@ def get_extensions() -> list[setuptools.Extension]:
             # An absent toolkit is survivable on a ROCm host, but must not turn an
             # NVIDIA source build into a successfully installed HIP-only package.
             _rocm_home, hip_compiler = get_rocm_path()
-            if hip_compiler is None or BUILD_NO_HIP:
+            if (hip_compiler is None or BUILD_NO_HIP) and not BUILD_XPU:
                 raise
-            if get_torch_gpu_runtime() == "cuda" and not BUILD_HIP:
+            if get_torch_gpu_runtime() == "cuda" and not BUILD_HIP and not BUILD_XPU:
                 raise CudaToolkitNotFoundError(
                     f"{e} A ROCm compiler was also found, but CUDA PyTorch is installed; "
                     "refusing to replace the missing CUDA backend with a HIP-only build. "
@@ -709,7 +735,8 @@ def get_extensions() -> list[setuptools.Extension]:
                     "request a cross-build with --hip."
                 ) from e
             print(f"\nNo CUDA toolkit ({e})")
-            print("A ROCm toolchain was found, so building the HIP backend instead.\n")
+            print("Building the explicitly requested XPU backend.\n" if BUILD_XPU else
+                  "A ROCm toolchain was found, so building the HIP backend instead.\n")
 
     # A CUDA source build stays CUDA-only unless HIP was explicitly requested.
     # This prevents an incidental ROCm SDK from multiplying build time and failure
@@ -720,6 +747,9 @@ def get_extensions() -> list[setuptools.Extension]:
         hip_ext = setup_hip_extension()
         if hip_ext is not None:
             extensions.append(hip_ext)
+
+    if BUILD_XPU:
+        extensions.append(setup_xpu_extension())
 
     if not extensions:
         print("\n" + "=" * 80)

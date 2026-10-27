@@ -63,6 +63,32 @@ Ascend support for `quantize_and_rotate_rowwise` requires
 These capabilities are registered only when the
 corresponding operator is available.
 
+## Intel XPU backend
+
+The optional `xpu` backend provides fused CR_INT8 weight dequantization and
+inverse rotation through `dequantize_int8_convrot_weight` and
+`dequantize_int8_convrot_weight_dtype`. It accepts contiguous INT8 `[N,K]`
+weights, scalar or `[N,1]` FP32 scales, group size 256, and FP32/FP16/BF16 output.
+Unsupported calls continue through the registry to eager.
+
+Initialize the oneAPI compiler environment, then build with:
+
+```bash
+COMFY_KITCHEN_BUILD_XPU=1 pip install .
+```
+
+The build requires the oneAPI `icpx` compiler, Python development headers,
+CMake >= 3.26, Ninja and nanobind. Set `COMFY_SYCL_CXX` to select another `icpx`
+path. Runtime requires XPU PyTorch with `current_stream().sycl_queue` and a
+SYCL runtime compatible with the compiler. Kernels use that current queue;
+tensor exchange uses DLPack without an ATen/libtorch build dependency.
+Python 3.12+ builds retain the existing stable ABI wheel convention.
+
+This implementation uses ordinary SYCL without SYCLTLA. It accelerates the
+dequantize-to-floating-point path; it does not register INT8 GEMM. The extension
+is loaded only in an XPU PyTorch process with an available device. Missing
+extensions/runtime leave the other backends usable.
+
 ## Huawei Ascend backend
 
 Ascend `convrot_w4a4_linear` requires `npu_quant_matmul`, not RotateQuant.

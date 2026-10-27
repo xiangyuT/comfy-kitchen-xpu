@@ -63,6 +63,12 @@ if getattr(torch.version, "hip", None):
 else:
     registry.mark_unavailable("hip", "PyTorch ROCm/HIP runtime not available")
 
+# A combined wheel must not load the SYCL runtime in a CPU/CUDA/ROCm process.
+if getattr(torch.version, "xpu", None) and torch.xpu.is_available():
+    from .backends import xpu as _xpu_backend  # noqa: F401
+else:
+    registry.mark_unavailable("xpu", "PyTorch XPU runtime or device not available")
+
 __all__ = [
     # Normalization
     "adaln",
