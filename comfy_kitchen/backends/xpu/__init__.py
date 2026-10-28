@@ -9,7 +9,7 @@ import torch
 from comfy_kitchen.allocation import allocation_context
 from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
 from comfy_kitchen.constraints import (
-    ExactDims, FunctionConstraints, ParamConstraint, sol_attn_common_call_rule,
+    ExactDims, FunctionConstraints, ParamConstraint, ValidationResult, sol_attn_common_call_rule,
     with_out_param,
 )
 from comfy_kitchen.registry import registry
@@ -39,6 +39,8 @@ __all__ = [
     "dequantize_int8_simple",
     "dequantize_int8_simple_dtype",
     "int8_linear",
+    "int8_linear_modulated",
+    "int8_linear_rms_modulated",
     "mm_int8",
     "prepare_int4_weight_for_int8_linear",
     "quantize_and_rotate_rowwise",
@@ -62,6 +64,7 @@ __all__ = [
     "gated_delta_decode_is_available",
     "gated_delta_decode_fused",
     "deltanet_conv_step",
+    "group_norm_stats3d",
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
     "fp16_linear",
@@ -87,6 +90,7 @@ _CONVROT_NATIVE_AVAILABLE = False
 _GGUF_AVAILABLE = False
 _SOL_AVAILABLE = False
 _SOL_ERROR = None
+_GROUP_NORM_STATS3D_AVAILABLE = False
 _GROUP_NORM_SILU_PAD3D_AVAILABLE = False
 _GROUP_NORM_SILU_PAD3D_OUT_AVAILABLE = False
 _FP16_LINEAR_AVAILABLE = False
@@ -136,36 +140,44 @@ def gated_delta_decode_fused(
     )
 
 
+def group_norm_stats3d(x, num_groups=32, eps=1e-6):
+    from omni_xpu_kernel import kitchen
+    return kitchen.group_norm_stats3d(x, num_groups, eps)
+
+
 def group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu,
-                          zero_pad=False):
+                          zero_pad=False, stats=None):
     from omni_xpu_kernel import kitchen
 
     if min(pad) < 0:
         raise ValueError("group_norm_silu_pad3d: padding must be non-negative")
-    if zero_pad and not _GROUP_NORM_SILU_PAD3D_OUT_AVAILABLE:
+    if (zero_pad and not _GROUP_NORM_SILU_PAD3D_OUT_AVAILABLE) or (stats is not None and not _GROUP_NORM_STATS3D_AVAILABLE):
         from comfy_kitchen.backends.eager import group_norm_silu_pad3d as eager_group_norm
         return eager_group_norm(
-            x, weight, bias, num_groups, eps, pad, silu, zero_pad,
+            x, weight, bias, num_groups, eps, pad, silu, zero_pad, stats,
         )
     return kitchen.group_norm_silu_pad3d(
         x,
         None if weight is None else weight.to(x.dtype),
         None if bias is None else bias.to(x.dtype),
-        num_groups, eps, tuple(pad), silu, zero_pad,
+        num_groups, eps, tuple(pad), silu, zero_pad, stats,
     )
 
 
 def group_norm_silu_pad3d_out(x, weight, bias, num_groups, eps, pad, silu,
-                              zero_pad, out):
+                              zero_pad, out, stats=None):
     from omni_xpu_kernel import kitchen
 
     if min(pad) < 0:
         raise ValueError("group_norm_silu_pad3d: padding must be non-negative")
+    if stats is not None and not _GROUP_NORM_STATS3D_AVAILABLE:
+        from comfy_kitchen.backends.eager import group_norm_silu_pad3d_out as eager_out
+        return eager_out(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out, stats)
     kitchen.group_norm_silu_pad3d_out(
         x,
         None if weight is None else weight.to(x.dtype),
         None if bias is None else bias.to(x.dtype),
-        num_groups, eps, tuple(pad), silu, zero_pad, out,
+        num_groups, eps, tuple(pad), silu, zero_pad, out, stats,
     )
 
 
@@ -236,6 +248,10 @@ try:
         _extension = omni_xpu_kernel._load_extension()
         _AVAILABLE = True
         _native_kitchen = getattr(_extension, "kitchen", None)
+        _GROUP_NORM_STATS3D_AVAILABLE = (
+            _native_kitchen is not None
+            and hasattr(_native_kitchen, "group_norm_stats3d")
+        )
         _GROUP_NORM_SILU_PAD3D_AVAILABLE = (
             _native_kitchen is not None
             and hasattr(_native_kitchen, "group_norm_silu_pad3d")
@@ -658,6 +674,113 @@ if _AVAILABLE:
                 out, add, add_scale,
             )
 
+        def _int8_linear_modulated_impl(
+            x: torch.Tensor, modulation_scale: torch.Tensor,
+            weight: torch.Tensor, weight_scale: torch.Tensor,
+            bias: torch.Tensor | None = None,
+            out_dtype: torch.dtype = torch.bfloat16,
+            convrot: bool = False, convrot_groupsize: int = 256,
+        ) -> torch.Tensor:
+            # Materialize dtype-rounded modulation and portable quantization
+            # before native GEMM. Legacy fused quantization divides in FP32;
+            # the new portable contract rounds that division in the input dtype.
+            # Bias also rounds after the projection, as in the reference.
+            from comfy_kitchen.backends.eager.quantization import (
+                _modulate_int8_input, quantize_and_rotate_rowwise,
+                quantize_int8_rowwise as reference_quantize,
+            )
+            x = _modulate_int8_input(x, modulation_scale)
+            if convrot:
+                from comfy_kitchen.tensor.int8_utils import _build_hadamard
+                h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+                quantized, scale = quantize_and_rotate_rowwise(x, h, convrot_groupsize)
+            else:
+                quantized, scale = reference_quantize(x)
+            result = _int8.int8_linear_prequantized(
+                quantized, scale, weight, weight_scale, None, out_dtype,
+            )
+            return result if bias is None else result + bias.to(result.dtype)
+
+        def _int8_linear_rms_modulated_impl(
+            x: torch.Tensor, norm_weight: torch.Tensor, norm_eps: float,
+            modulation_scale: torch.Tensor,
+            weight: torch.Tensor, weight_scale: torch.Tensor,
+            bias: torch.Tensor | None = None,
+            out_dtype: torch.dtype = torch.bfloat16,
+            convrot: bool = False, convrot_groupsize: int = 256,
+        ) -> torch.Tensor:
+            # RMSNorm rounds before modulation in the upstream reference.
+            normalized = torch.nn.functional.rms_norm(
+                x, (x.shape[-1],), norm_weight, norm_eps,
+            )
+            return _int8_linear_modulated_impl(
+                normalized, modulation_scale, weight, weight_scale, bias,
+                out_dtype, convrot, convrot_groupsize,
+            )
+
+        # Keep the input-dtype rounding boundaries opaque to Inductor fusion.
+        @torch.library.custom_op("comfy_kitchen_xpu::int8_linear_modulated", mutates_args=())
+        def _compiled_modulated(
+            x: torch.Tensor, modulation_scale: torch.Tensor,
+            weight: torch.Tensor, weight_scale: torch.Tensor,
+            bias: torch.Tensor | None, output_dtype_code: int,
+            convrot: bool, convrot_groupsize: int,
+        ) -> torch.Tensor:
+            return _int8_linear_modulated_impl(
+                x, modulation_scale, weight, weight_scale, bias,
+                _INT8_LINEAR_DTYPES[output_dtype_code], convrot, convrot_groupsize,
+            )
+
+        @_compiled_modulated.register_fake
+        def _compiled_modulated_fake(x, modulation_scale, weight, weight_scale,
+                                      bias, output_dtype_code, convrot, convrot_groupsize):
+            return x.new_empty((*x.shape[:-1], weight.shape[0]),
+                               dtype=_INT8_LINEAR_DTYPES[output_dtype_code])
+
+        @torch.library.custom_op("comfy_kitchen_xpu::int8_linear_rms_modulated", mutates_args=())
+        def _compiled_rms_modulated(
+            x: torch.Tensor, norm_weight: torch.Tensor, norm_eps: float,
+            modulation_scale: torch.Tensor, weight: torch.Tensor,
+            weight_scale: torch.Tensor, bias: torch.Tensor | None,
+            output_dtype_code: int, convrot: bool, convrot_groupsize: int,
+        ) -> torch.Tensor:
+            return _int8_linear_rms_modulated_impl(
+                x, norm_weight, norm_eps, modulation_scale, weight, weight_scale,
+                bias, _INT8_LINEAR_DTYPES[output_dtype_code], convrot, convrot_groupsize,
+            )
+
+        @_compiled_rms_modulated.register_fake
+        def _compiled_rms_modulated_fake(x, norm_weight, norm_eps, modulation_scale,
+                                         weight, weight_scale, bias, output_dtype_code,
+                                         convrot, convrot_groupsize):
+            return x.new_empty((*x.shape[:-1], weight.shape[0]),
+                               dtype=_INT8_LINEAR_DTYPES[output_dtype_code])
+
+        def int8_linear_modulated(
+            x: torch.Tensor, modulation_scale: torch.Tensor,
+            weight: torch.Tensor, weight_scale: torch.Tensor,
+            bias: torch.Tensor | None = None, out_dtype: torch.dtype = torch.bfloat16,
+            convrot: bool = False, convrot_groupsize: int = 256,
+        ) -> torch.Tensor:
+            if torch.compiler.is_compiling():
+                return _compiled_modulated(x, modulation_scale, weight, weight_scale,
+                    bias, _INT8_LINEAR_DTYPES.index(out_dtype), convrot, convrot_groupsize)
+            return _int8_linear_modulated_impl(x, modulation_scale, weight, weight_scale,
+                                               bias, out_dtype, convrot, convrot_groupsize)
+
+        def int8_linear_rms_modulated(
+            x: torch.Tensor, norm_weight: torch.Tensor, norm_eps: float,
+            modulation_scale: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+            bias: torch.Tensor | None = None, out_dtype: torch.dtype = torch.bfloat16,
+            convrot: bool = False, convrot_groupsize: int = 256,
+        ) -> torch.Tensor:
+            if torch.compiler.is_compiling():
+                return _compiled_rms_modulated(x, norm_weight, norm_eps, modulation_scale,
+                    weight, weight_scale, bias, _INT8_LINEAR_DTYPES.index(out_dtype),
+                    convrot, convrot_groupsize)
+            return _int8_linear_rms_modulated_impl(x, norm_weight, norm_eps, modulation_scale,
+                weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize)
+
     if _NORM_AVAILABLE:
         from .adaln import adaln, rms_adaln
 
@@ -738,6 +861,15 @@ _CODE_TO_DTYPE = {
     1: torch.float16,
     2: torch.bfloat16,
 }
+
+
+def _modulated_int8_call_rule(kwargs):
+    x = kwargs.get("x")
+    for name in ("modulation_scale", "norm_weight"):
+        value = kwargs.get(name)
+        if value is not None and value.dtype != x.dtype:
+            return ValidationResult.fail(name, "mixed-dtype modulation uses the eager route")
+    return ValidationResult.ok()
 
 
 def _build_constraints() -> dict[str, FunctionConstraints]:
@@ -823,6 +955,18 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
             default_devices=xpu,
         ),
     }
+    if _INT8_AVAILABLE and hasattr(_native_int8, "int8_linear_prequantized"):
+        for name in ("int8_linear_modulated", "int8_linear_rms_modulated"):
+            params = {key: value for key, value in capabilities["int8_linear"].params.items()
+                      if key not in ("input_act", "input_act_weight", "input_act_eps",
+                                     "residual", "residual_scale")}
+            params["modulation_scale"] = ParamConstraint(dtypes=floats)
+            if name == "int8_linear_rms_modulated":
+                params["norm_weight"] = ParamConstraint(dtypes=floats)
+                params["norm_eps"] = ParamConstraint(dtypes=frozenset({float}))
+            capabilities[name] = FunctionConstraints(
+                params=params, default_devices=xpu, call_rules=(_modulated_int8_call_rule,),
+            )
     if not _INT8_AVAILABLE:
         capabilities.clear()
     elif hasattr(_native_int8, "int8_linear_prequantized"):
@@ -938,12 +1082,18 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
                 },
                 default_devices=xpu,
             )
+    if _GROUP_NORM_STATS3D_AVAILABLE:
+        capabilities["group_norm_stats3d"] = FunctionConstraints(
+            params={"x": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(5),))},
+            default_devices=xpu,
+        )
     if _GROUP_NORM_SILU_PAD3D_AVAILABLE:
         capabilities["group_norm_silu_pad3d"] = FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(5),)),
                 "weight": ParamConstraint(dtypes=floats),
                 "bias": ParamConstraint(dtypes=floats),
+                "stats": ParamConstraint(dtypes=frozenset({torch.float32})),
             },
             default_devices=xpu,
         )
