@@ -21,7 +21,7 @@ from .exceptions import (
 from .flash_attention import flash_attention_decode
 from .flash_attention import is_available as flash_attention_decode_is_available
 from .flash_attention import flash_attention_decode_gqa, flash_attention_decode_gqa_is_available
-from .flash_attention import flash_attention_decode_step_merge
+from .flash_attention import flash_attention_decode_step_merge, flash_attention_decode_tree_merge
 from .float_utils import from_blocked, swap_nibbles, to_blocked
 from .gguf import dequantize_gguf, get_gguf_route_diagnostics
 from .gated_delta import deltanet_conv_step, gated_delta_decode_fused
@@ -78,8 +78,10 @@ __all__ = [
     "__version__",
     # Normalization
     "adaln",
+    "rms_gated_residual",
     "fp16_conv3d",
     "group_norm_silu_pad3d",
+    "group_norm_stats3d",
     "rms_adaln",
     # Attention
     "PrequantizedInt8Attention",
@@ -91,6 +93,7 @@ __all__ = [
     "flash_attention_decode_gqa",
     "flash_attention_decode_gqa_is_available",
     "flash_attention_decode_step_merge",
+    "flash_attention_decode_tree_merge",
     "gated_delta_decode_fused",
     "deltanet_conv_step",
     "gated_delta_decode_is_available",
@@ -137,6 +140,8 @@ __all__ = [
     "gemv_awq_w4a16",
     "fp16_linear",
     "int8_linear",
+    "int8_linear_modulated",
+    "int8_linear_rms_modulated",
     "w4a8_int8_linear",
     # Positional encoding
     "apply_rope",
@@ -185,6 +190,12 @@ __all__ = [
 # =============================================================================
 # Public API Functions
 # =============================================================================
+
+
+def _call_backend(name: str, kwargs: dict):
+    """Dispatch a thin public wrapper whose signature matches its backends."""
+    impl = registry.get_implementation(name, kwargs=kwargs)
+    return impl(**kwargs)
 
 
 def sol_attn(
@@ -428,21 +439,29 @@ def group_norm_silu_pad3d(
     silu: bool = True,
     zero_pad: bool = False,
     out: torch.Tensor | None = None,
+    stats: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-frame GroupNorm, SiLU and causal conv3d padding in one pass.
 
-    x [B, C, T, H, W]; pad is (left, right, top, bottom, front). The spatial
-    border reflects unless zero_pad is set; front frames are always zero.
-    If out is provided, write into that tensor or frame-offset view.
+    x [B, C, T, H, W]; pad is (left, right, top, bottom, front). The spatial border
+    reflects, or is zero when zero_pad; the front frames are always zero. weight=None is
+    pad-only. stats from group_norm_stats3d normalizes with those per-frame statistics
+    instead of x's own, so x may be a row strip of the frame they describe. Output is
+    channels_last_3d, into out when given, which is returned; for a batch of one out may
+    be a frame-offset view, leaving room for a caller's real halo.
     """
     if out is None:
         return torch.ops.comfy_kitchen.group_norm_silu_pad3d(
-            x, weight, bias, num_groups, eps, list(pad), silu, zero_pad,
-        )
+            x, weight, bias, num_groups, eps, list(pad), silu, zero_pad, stats)
     torch.ops.comfy_kitchen.group_norm_silu_pad3d_out(
-        x, weight, bias, num_groups, eps, list(pad), silu, zero_pad, out,
-    )
+        x, weight, bias, num_groups, eps, list(pad), silu, zero_pad, out, stats)
     return out
+
+
+def group_norm_stats3d(x: torch.Tensor, num_groups: int = 32, eps: float = 1e-6) -> torch.Tensor:
+    """Per-frame GroupNorm statistics of x [B, C, T, H, W]: float32 [B*T, num_groups, 2]
+    of (mean, rstd), for group_norm_silu_pad3d's stats argument."""
+    return torch.ops.comfy_kitchen.group_norm_stats3d(x, num_groups, eps)
 
 
 def rms_adaln(
@@ -1039,6 +1058,29 @@ def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return impl(**kwargs)
 
 
+def rms_gated_residual(
+    activation: torch.Tensor,
+    norm_weight: torch.Tensor,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float = 1.0e-5,
+) -> torch.Tensor:
+    """Compute ``residual + gate * rms_norm(activation, norm_weight)``.
+
+    Each step is rounded to the input dtype as in the unfused PyTorch ops.
+    """
+    return _call_backend(
+        "rms_gated_residual",
+        {
+            "activation": activation,
+            "norm_weight": norm_weight,
+            "residual": residual,
+            "gate": gate,
+            "eps": eps,
+        },
+    )
+
+
 def fp16_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1141,6 +1183,66 @@ def int8_linear(
     }
     impl = registry.get_implementation("int8_linear", kwargs=kwargs)
     return impl(**kwargs)
+
+
+def int8_linear_modulated(
+    x: torch.Tensor,
+    modulation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    """Batch-one modulation with fused INT8 quantization."""
+    if out_dtype is None:
+        out_dtype = torch.bfloat16
+    return _call_backend(
+        "int8_linear_modulated",
+        {
+            "x": x,
+            "modulation_scale": modulation_scale,
+            "weight": weight,
+            "weight_scale": weight_scale,
+            "bias": bias,
+            "out_dtype": out_dtype,
+            "convrot": convrot,
+            "convrot_groupsize": convrot_groupsize,
+        },
+    )
+
+
+def int8_linear_rms_modulated(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    modulation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    """INT8 projection with RMSNorm and batch-one modulation in its producer."""
+    if out_dtype is None:
+        out_dtype = torch.bfloat16
+    return _call_backend(
+        "int8_linear_rms_modulated",
+        {
+            "x": x,
+            "norm_weight": norm_weight,
+            "norm_eps": norm_eps,
+            "modulation_scale": modulation_scale,
+            "weight": weight,
+            "weight_scale": weight_scale,
+            "bias": bias,
+            "out_dtype": out_dtype,
+            "convrot": convrot,
+            "convrot_groupsize": convrot_groupsize,
+        },
+    )
 
 
 def delaunay3d(points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

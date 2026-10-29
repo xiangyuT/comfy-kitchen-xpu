@@ -90,7 +90,7 @@ class Int8DecodeCache:
         """BF16 query [B,H,S,256]; return [B,S,H*256] and natural-log LSE [B,H,S].
 
         Every query attends the same committed prefix. The caller merges the current
-        causal rows separately, preserving speculative rollback semantics.
+        causal/tree rows separately, preserving speculative rollback semantics.
         """
         if self._xpu:
             self._validate_length(length)

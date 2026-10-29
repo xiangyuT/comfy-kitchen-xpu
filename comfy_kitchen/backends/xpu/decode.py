@@ -47,11 +47,12 @@ def int8_is_available(device):
         return False
 
 
-def gqa(q, k, v, lengths):
+def gqa(q, k, v, lengths, return_lse=False, causal=True):
     from omni_xpu_kernel import kitchen
 
     _validate(q, k, v, lengths)
-    return kitchen.decode_attention(q, k, v, lengths)[0]
+    output, lse = kitchen.decode_attention(q, k, v, lengths, causal)
+    return (output, lse) if return_lse else output
 
 
 def step_merge(out, lse, q, k, v, merged):
@@ -61,13 +62,20 @@ def step_merge(out, lse, q, k, v, merged):
     return merged
 
 
+def tree_merge(out, lse, q, k, v, mask, merged):
+    from omni_xpu_kernel import kitchen
+    _validate(q, k, v)
+    kitchen.decode_tree_merge(out, lse, q, k, v, mask, merged)
+    return merged
+
+
 def _validate(q, k, v, lengths=None):
     if q.ndim != 4 or k.ndim != 4 or v.shape != k.shape:
         raise ValueError("decode requires q [B,H,S,D] and matching k/v [B,Hk,L,D]")
     if q.shape[0] != k.shape[0] or q.shape[-1] != k.shape[-1]:
         raise ValueError("decode batch and head dimensions must match")
-    if q.shape[-1] not in (128, 256) or k.shape[1] == 0 or q.shape[1] % k.shape[1] or q.shape[2] == 0 or k.shape[2] == 0:
-        raise ValueError("XPU decode requires D=128/256, nonempty cache/query and H divisible by Hk")
+    if q.shape[-1] not in (64, 128, 256) or k.shape[1] == 0 or q.shape[1] % k.shape[1] or q.shape[2] == 0 or k.shape[2] == 0:
+        raise ValueError("XPU decode requires D=64/128/256, nonempty cache/query and H divisible by Hk")
     operands = (k, v) if lengths is None else (k, v, lengths)
     if any(t.device != q.device for t in operands):
         raise ValueError("decode inputs must share one device")
