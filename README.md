@@ -163,9 +163,10 @@ decode APIs' `is_available` functions for their separate native entry points.
 `input_act="situ"` consumes `[hidden | gate]` halves and halves the input width.
 A matching companion provides native SiTU, optional ConvRot and INT8 quantization
 for BF16/FP16 inputs with activated width up to 8192 and ConvRot groups 64/256.
-This path is shared by INT8 and W4A8/W6A8 linear. Wider inputs and older companion
-wheels use the device-side Torch activation preparation before the existing
-native INT8 GEMM. Backend overrides continue to apply.
+This path is shared by INT8 and W4A8/W6A8 linear. Wider inputs and companions
+without gated quantization use device-side Torch activation preparation.
+Linear dispatch still follows the packed-decode requirements below. Backend
+overrides continue to apply.
 
 ### Decode APIs
 
@@ -175,8 +176,13 @@ packed-weight native GEMV for one to eight activation rows, decoding each group
 onto the INT8 grid inside the dot product. FP32 and FP8 E4M3 group scales and
 the upstream codebook are supported without materializing a full INT8 weight.
 Activation and residual preparation retain their existing contracts. W6A8,
-larger row counts and older companion builds retain the established native INT8
-GEMM route. CUDA's resident MMA weight records are unpacked
+row counts above eight and empty batches retain the established native INT8 GEMM route.
+For W4A8 decode with one to eight rows, the XPU backend requires contiguous
+`qdata` and `s_rel`, FP32 or FP8 E4M3 group scales, and a matching packed-decode
+companion. A violated layout/dtype contract or missing companion raises an
+explicit error before activation preparation; it does not silently materialize
+a full INT8 weight and switch to the older GEMM API.
+CUDA's resident MMA weight records are unpacked
 to canonical storage when moved to XPU or CPU; XPU does not produce that layout.
 
 BF16 GQA decode, current-step merging, and the growing INT8 KV cache use native
@@ -329,6 +335,8 @@ revision/version and XPU target.
 - W4A8 packed decode requires a companion exporting
   `int8.w4a8_linear_prequantized`; query
   `int8.supports_w4a8_linear_prequantized()` before using it directly.
+  W4A8 decode on the XPU backend reports unsupported layouts, group-scale
+  dtypes and missing packed-decode companions explicitly.
   Asymmetric correction retains eager. W6A8, prefill and requantization keep
   their established preparation paths.
 - Native wheels are CPython-, Torch-ABI-, and target-specific.

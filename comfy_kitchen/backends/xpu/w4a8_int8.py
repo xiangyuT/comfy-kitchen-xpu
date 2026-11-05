@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from comfy_kitchen.allocation import allocation_context
@@ -32,6 +34,24 @@ def w4a8_int8_linear(
     _, k, bits = validate_w4a8_operands(
         qdata, s_rel, s_channel, codebook, correction, group_size, convrot_groupsize,
     )
+    # Activations preserve the leading dimensions, including SiTU/SwiGLU's
+    # last-dimension split. Validate decode before any activation preparation.
+    rows = math.prod(x.shape[:-1])
+    packed_decode = bits == 4 and 0 < rows <= 8
+    if packed_decode:
+        if not qdata.is_contiguous():
+            raise ValueError("XPU packed W4A8 decode requires contiguous qdata")
+        if not s_rel.is_contiguous():
+            raise ValueError("XPU packed W4A8 decode requires contiguous s_rel")
+        if s_rel.dtype not in (torch.float32, torch.float8_e4m3fn):
+            raise TypeError("XPU packed W4A8 decode requires FP32 or FP8 E4M3 s_rel")
+        packed_available = getattr(_int8, "supports_w4a8_linear_prequantized", None)
+        if (not callable(packed_available) or not packed_available()
+                or not callable(getattr(_int8, "w4a8_linear_prequantized", None))):
+            raise RuntimeError(
+                "XPU W4A8 decode with 1-8 rows requires a matching omni_xpu_kernel "
+                "companion exporting int8.w4a8_linear_prequantized"
+            )
     prepared = None
     if (input_act == "situ" and _GATED_QUANTIZE_AVAILABLE and x.device.type == "xpu"
             and x.dtype in (torch.float16, torch.bfloat16)
@@ -46,14 +66,6 @@ def w4a8_int8_linear(
             raise ValueError(f"Input K={x.shape[-1]} does not match qdata K={k}")
     if correction is not None:
         raise ValueError("asymmetric W4A8 correction requires the eager route")
-    rows = (prepared[0].numel() if prepared is not None else x.numel()) // k
-    packed_available = getattr(_int8, "supports_w4a8_linear_prequantized", None)
-    packed_decode = (
-        bits == 4 and 0 < rows <= 8 and qdata.is_contiguous()
-        and s_rel.is_contiguous()
-        and s_rel.dtype in (torch.float32, torch.float8_e4m3fn)
-        and callable(packed_available) and packed_available()
-    )
     if not packed_decode:
         weight = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
     if prepared is None:
