@@ -29,7 +29,7 @@ def w4a8_int8_linear(
 ):
     from . import _GATED_QUANTIZE_AVAILABLE, _int8
 
-    _, k, _ = validate_w4a8_operands(
+    _, k, bits = validate_w4a8_operands(
         qdata, s_rel, s_channel, codebook, correction, group_size, convrot_groupsize,
     )
     prepared = None
@@ -46,14 +46,30 @@ def w4a8_int8_linear(
             raise ValueError(f"Input K={x.shape[-1]} does not match qdata K={k}")
     if correction is not None:
         raise ValueError("asymmetric W4A8 correction requires the eager route")
-    weight = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
+    rows = (prepared[0].numel() if prepared is not None else x.numel()) // k
+    packed_available = getattr(_int8, "supports_w4a8_linear_prequantized", None)
+    packed_decode = (
+        bits == 4 and 0 < rows <= 8 and qdata.is_contiguous()
+        and s_rel.is_contiguous()
+        and s_rel.dtype in (torch.float32, torch.float8_e4m3fn)
+        and callable(packed_available) and packed_available()
+    )
+    if not packed_decode:
+        weight = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
     if prepared is None:
         with allocation_context():
             h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
         quantized, scale = quantize_and_rotate_rowwise(x, h, convrot_groupsize)
     else:
         quantized, scale = prepared
-    out = _int8.int8_linear_prequantized(
-        quantized, scale, weight, s_channel.float(), bias=bias, out_dtype=out_dtype,
-    )
+    if packed_decode:
+        out = _int8.w4a8_linear_prequantized(
+            quantized.contiguous(), scale, qdata, s_rel, s_channel.float(),
+            codebook=codebook.float().contiguous() if codebook is not None else None,
+            bias=bias, group_size=group_size, out_dtype=out_dtype,
+        )
+    else:
+        out = _int8.int8_linear_prequantized(
+            quantized, scale, weight, s_channel.float(), bias=bias, out_dtype=out_dtype,
+        )
     return apply_residual(out, residual, residual_scale)

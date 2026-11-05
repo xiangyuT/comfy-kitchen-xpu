@@ -41,13 +41,16 @@ def test_quantized_linear_input_act_and_residual(bits, rows, activation, monkeyp
     with ck.use_backend("xpu"):
         expected = torch.addcmul(residual, torch.nn.functional.linear(activated, weight, bias), scale)
     calls = []
-    native = xpu._native_int8.int8_linear_prequantized
+    name = ("w4a8_linear_prequantized" if bits == 4 and
+            getattr(xpu._int8, "supports_w4a8_linear_prequantized", lambda: False)()
+            else "int8_linear_prequantized")
+    native = getattr(xpu._native_int8, name)
 
     def tracked(*args, **kwargs):
         calls.append(True)
         return native(*args, **kwargs)
 
-    monkeypatch.setattr(xpu._native_int8, "int8_linear_prequantized", tracked)
+    monkeypatch.setattr(xpu._native_int8, name, tracked)
     with ck.use_backend("xpu"):
         actual = weight.linear_input_act(x, bias, activation, norm, 1e-6, residual, scale)
     assert calls == [True]
@@ -87,13 +90,16 @@ def test_grouped_storage_native_linear(bits, dtype, with_bias, monkeypatch):
         weight, bits=bits, scale_dtype=torch.float32, scale_search=False,
     )
     calls = []
-    original = xpu._native_int8.int8_linear_prequantized
+    name = ("w4a8_linear_prequantized" if bits == 4 and
+            getattr(xpu._int8, "supports_w4a8_linear_prequantized", lambda: False)()
+            else "int8_linear_prequantized")
+    original = getattr(xpu._native_int8, name)
 
     def native(*args, **kwargs):
         calls.append(True)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(xpu._native_int8, "int8_linear_prequantized", native)
+    monkeypatch.setattr(xpu._native_int8, name, native)
     with ck.use_backend("xpu"):
         actual = ck.w4a8_int8_linear(
             x, q, scale, channel, codebook=codebook, bias=bias, out_dtype=dtype,
@@ -199,3 +205,48 @@ def test_rotation_cache_uses_kitchen_allocation_context(monkeypatch):
     finally:
         ck.set_allocation_context(previous)
     assert entered == [True] and not context.active
+
+
+@pytest.mark.parametrize("group_size", [4, 16, 64, 256])
+@pytest.mark.parametrize("scale_dtype", [torch.float32, torch.float8_e4m3fn])
+def test_packed_decode_avoids_full_weight_materialization(group_size, scale_dtype, monkeypatch):
+    from comfy_kitchen.backends import xpu
+    from comfy_kitchen.backends.xpu import w4a8_int8 as backend
+    if not getattr(xpu._int8, "supports_w4a8_linear_prequantized", lambda: False)():
+        pytest.skip("packed W4A8 companion core required")
+    torch.manual_seed(811)
+    x=torch.randn(1,512,device="xpu",dtype=torch.bfloat16)
+    q,scales,channel,_,codebook=eager.quantize_w4a8_int8_weight(
+        torch.randn(71,512,device="xpu",dtype=x.dtype)*.02,
+        group_size=group_size,scale_dtype=scale_dtype,scale_search=False)
+    reference=eager.w4a8_int8_linear(x,q,scales,channel,codebook=codebook,
+                                   group_size=group_size,out_dtype=x.dtype)
+    def forbidden(*args,**kwargs):
+        raise AssertionError("packed decode materialized a complete INT8 weight")
+    monkeypatch.setattr(backend,"_dequant_int4_grouped_to_int8",forbidden)
+    with ck.use_backend("xpu"):
+        actual=ck.w4a8_int8_linear(x,q,scales,channel,codebook=codebook,
+                                  group_size=group_size,out_dtype=x.dtype)
+    torch.testing.assert_close(actual,reference,rtol=.025,atol=.005)
+
+
+@pytest.mark.parametrize("rows,bits,legacy_core", [(9,4,False),(1,6,False),(1,4,True)])
+def test_existing_routes_remain_available(rows,bits,legacy_core,monkeypatch):
+    from comfy_kitchen.backends import xpu
+    from comfy_kitchen.backends.xpu import w4a8_int8 as backend
+    torch.manual_seed(813)
+    x=torch.randn(rows,256,device="xpu",dtype=torch.bfloat16)
+    q,scales,channel,_,codebook=eager.quantize_w4a8_int8_weight(
+        torch.randn(49,256,device="xpu",dtype=x.dtype)*.02,
+        bits=bits,scale_search=False,scale_dtype=torch.float32)
+    decode=backend._dequant_int4_grouped_to_int8;calls=[]
+    def observed(*args,**kwargs):
+        calls.append(True);return decode(*args,**kwargs)
+    monkeypatch.setattr(backend,"_dequant_int4_grouped_to_int8",observed)
+    if legacy_core:
+        monkeypatch.setattr(xpu._int8,"supports_w4a8_linear_prequantized",lambda:False,raising=False)
+    with ck.use_backend("xpu"):
+        actual=ck.w4a8_int8_linear(x,q,scales,channel,codebook=codebook,out_dtype=x.dtype)
+    assert calls==[True]
+    reference=eager.w4a8_int8_linear(x,q,scales,channel,codebook=codebook,out_dtype=x.dtype)
+    torch.testing.assert_close(actual,reference,rtol=.025,atol=.005)
