@@ -26,8 +26,7 @@ from comfy_kitchen.tensor.w4a8_packed import (
 def test_new_linear_keywords_keep_native_gemm(bits, activation, with_residual, monkeypatch):
     calls = []
 
-    def integer_gemm(qx, sx, qw, sw, bias, out_dtype):
-        calls.append((qx.dtype, qw.dtype))
+    def scale_integer_dot(qx, sx, qw, sw, bias, out_dtype):
         shape = (*qx.shape[:-1], qw.shape[0])
         result = qx.reshape(-1, qx.shape[-1]).int() @ qw.int().t()
         out = (result.float() * (sx.reshape(-1, 1) * sw.reshape(1, -1))).to(out_dtype)
@@ -35,7 +34,22 @@ def test_new_linear_keywords_keep_native_gemm(bits, activation, with_residual, m
             out = out + bias.to(out_dtype)
         return out.reshape(shape)
 
-    monkeypatch.setattr(xpu, "_int8", SimpleNamespace(int8_linear_prequantized=integer_gemm), raising=False)
+    def integer_gemm(qx, sx, qw, sw, bias, out_dtype):
+        calls.append(("int8", qx.dtype, qw.dtype))
+        return scale_integer_dot(qx, sx, qw, sw, bias, out_dtype)
+
+    def packed_linear(qx, sx, packed, relative, channel, codebook=None,
+                      bias=None, group_size=16, out_dtype=torch.bfloat16):
+        calls.append(("packed", qx.dtype, packed.dtype))
+        decoded = eager._dequant_int4_grouped_to_int8(
+            packed, relative, codebook, group_size)
+        return scale_integer_dot(qx, sx, decoded, channel, bias, out_dtype)
+
+    monkeypatch.setattr(xpu, "_int8", SimpleNamespace(
+        supports_w4a8_linear_prequantized=lambda: True,
+        w4a8_linear_prequantized=packed_linear,
+        int8_linear_prequantized=integer_gemm,
+    ), raising=False)
     torch.manual_seed(131)
     weight = torch.randn(32, 256, dtype=torch.bfloat16) * 0.02
     q, scale, channel, correction, codebook = eager.quantize_w4a8_int8_weight(
@@ -53,7 +67,7 @@ def test_new_linear_keywords_keep_native_gemm(bits, activation, with_residual, m
                   residual=residual, residual_scale=residual_scale)
     actual = adapter.w4a8_int8_linear(raw_x, q, scale, channel, **kwargs)
     expected = eager.w4a8_int8_linear(raw_x, q, scale, channel, **kwargs)
-    assert calls == [(torch.int8, torch.int8)]
+    assert calls == [("packed" if bits == 4 else "int8", torch.int8, torch.int8)]
     assert torch.equal(raw_x, original)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
