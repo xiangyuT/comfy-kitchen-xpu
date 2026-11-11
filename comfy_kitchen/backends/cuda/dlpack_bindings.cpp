@@ -17,6 +17,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/vector.h>
 #include <cuda_runtime.h>
 #include <climits>
 #include <cstring>
@@ -266,6 +267,13 @@ extern "C" {
         int causal_t, int causal_h, int causal_w,
         float scale, int dtype_code, cudaStream_t stream);
 
+    // Window attention over stacked key planes — see ops/na3d.cu.
+    void launch_window_attention_kernel(
+        const void* q, const void* k, const void* v, void* out,
+        int batch, int tq, int tk, int h_size, int w_size, int num_heads, int kv_heads, int head_dim,
+        const int* kh, const int* kw, int n_windows, int temporal_window, int clamp,
+        float scale, int dtype_code, cudaStream_t stream);
+
     // Sol-Attn sparse attention — see sage_attention/sol_attn.cu.
     extern const char* const sol_attn_plan_names[];   // null-terminated
     int sol_attn_plan(int batch, int seq_len, int num_heads, int n_tok, int64_t* out, int cap);
@@ -361,6 +369,9 @@ extern "C" {
     void launch_closest_point_on_mesh(const void* points, int n_points, const void* tris, const void* tri_index,
                                       int n_leaves, const void* child, const void* box, float max_dist, void* dist,
                                       void* closest, void* face, cudaStream_t stream);
+    void launch_closest_hit_on_mesh(const void* origins, const void* directions, int n_rays, const void* tris,
+                                    const void* tri_index, int n_leaves, const void* child, const void* box, float tmin,
+                                    float tmax, bool cull_backface, void* t, void* face, cudaStream_t stream);
 
     // Union-find connected components — see ops/connected_components.cu.
     void launch_connected_components(const void* edges, int64_t n_edges, bool edges_int64, int n_nodes,
@@ -1573,6 +1584,30 @@ void na3d(
         scale, dtype_code, stream);
 }
 
+// Nanobind wrapper for window attention over stacked key planes
+void window_attention(
+    nb::ndarray<nb::device::cuda> q,
+    nb::ndarray<nb::device::cuda> k,
+    nb::ndarray<nb::device::cuda> v,
+    nb::ndarray<nb::device::cuda> out,
+    int64_t batch, int64_t tq, int64_t tk, int64_t h_size, int64_t w_size,
+    int64_t num_heads, int64_t kv_heads, int64_t head_dim,
+    const std::vector<int>& kh, const std::vector<int>& kw,
+    int64_t temporal_window, int clamp,
+    float scale,
+    int dtype_code,
+    uintptr_t stream_ptr)
+{
+    if (kh.size() != kw.size() || kh.empty() || kh.size() > 8)
+        throw std::invalid_argument("window_attention: kh and kw need the same length, 1 to 8 windows");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_window_attention_kernel(
+        q.data(), k.data(), v.data(), out.data(),
+        (int)batch, (int)tq, (int)tk, (int)h_size, (int)w_size, (int)num_heads, (int)kv_heads, (int)head_dim,
+        kh.data(), kw.data(), (int)kh.size(), (int)temporal_window, clamp,
+        scale, dtype_code, stream);
+}
+
 // Nanobind wrappers for Sol-Attn sparse attention
 static void check_block_len(const nb::ndarray<nb::device::cuda>& b, int64_t seq_len, const char* who) {
     if (b.dtype() != nb::dtype<int32_t>() || b.ndim() != 1 || b.stride(0) != 1 ||
@@ -1875,6 +1910,14 @@ void closest_point_on_mesh(cuda_array points, int n_points, cuda_array tris, cud
     launch_closest_point_on_mesh(points.data(), n_points, tris.data(), tri_index.data(), n_leaves, child.data(),
                                  box.data(), max_dist, dist.data(), closest.data(), face.data(),
                                  reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void closest_hit_on_mesh(cuda_array origins, cuda_array directions, int n_rays, cuda_array tris, cuda_array tri_index,
+                         int n_leaves, cuda_array child, cuda_array box, float tmin, float tmax, bool cull_backface,
+                         cuda_array t, cuda_array face, uintptr_t stream_ptr) {
+    launch_closest_hit_on_mesh(origins.data(), directions.data(), n_rays, tris.data(), tri_index.data(), n_leaves,
+                               child.data(), box.data(), tmin, tmax, cull_backface, t.data(), face.data(),
+                               reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 void connected_components(cuda_array edges, int64_t n_edges, bool edges_int64, int n_nodes, cuda_array parent,
@@ -2329,6 +2372,9 @@ extern "C" {
     void launch_pack_w4a8_mma_inplace(
         void* data, const void* scales, void* scratch,
         int64_t N, int64_t K, int bits, cudaStream_t stream);
+
+    int64_t memmove_flag_count(int64_t nbytes);
+    void launch_memmove(void* dst, const void* src, int64_t nbytes, void* flags, cudaStream_t stream);
 
     bool launch_w4a8_codebook_gemm_chunked(
         const void* xq,
@@ -3440,6 +3486,19 @@ void pack_w4a8_mma_inplace(
         throw std::runtime_error("pack_w4a8_mma_inplace: invalid storage or scratch geometry");
     launch_pack_w4a8_mma_inplace(data.data(), scales.data(), scratch.data(),
         N, K, bits, reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void memmove_bytes(
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> dst,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> src,
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> flags,
+    uintptr_t stream_ptr) {
+    const int64_t nbytes = dst.size();
+    if (src.size() != static_cast<size_t>(nbytes) || nbytes % 16 || dst.stride(0) != 1 || src.stride(0) != 1
+            || reinterpret_cast<uintptr_t>(dst.data()) % 16 || reinterpret_cast<uintptr_t>(src.data()) % 16
+            || flags.stride(0) != 1 || flags.size() < static_cast<size_t>(memmove_flag_count(nbytes)))
+        throw std::runtime_error("memmove: ranges must be equal, 16-byte aligned multiples of 16 bytes with enough flags");
+    launch_memmove(dst.data(), src.data(), nbytes, flags.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Returns the code width (4 or 6) implied by the packed weight row.
@@ -4871,6 +4930,10 @@ NB_MODULE(_C, m) {
           "In-place backwards slab expansion into tiled codes and interleaved scales",
           nb::arg("data"), nb::arg("scales"), nb::arg("scratch"), nb::arg("stream_ptr"));
 
+    m.def("memmove", &memmove_bytes,
+          "Overlap-safe byte move; flags is zeroed int32 scratch of nbytes // 65536 + 2 entries",
+          nb::arg("dst"), nb::arg("src"), nb::arg("flags"), nb::arg("stream_ptr"));
+
     m.def("w4a8_codebook_gemm_chunked", &w4a8_codebook_gemm_chunked,
           "Chunked fused W4A8: per-chunk codebook+s_rel dequant -> L2-hot int8 -> strided int8 GEMM",
           nb::arg("xq"), nb::arg("weight"), nb::arg("s_rel"), nb::arg("codebook").none(),
@@ -5204,6 +5267,14 @@ NB_MODULE(_C, m) {
           nb::arg("causal_t"), nb::arg("causal_h"), nb::arg("causal_w"),
           nb::arg("scale"), nb::arg("dtype_code"), nb::arg("stream_ptr"));
 
+    m.def("window_attention", &window_attention,
+          "Window attention over stacked key planes (per-plane windows, GQA)",
+          nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("out"),
+          nb::arg("batch"), nb::arg("tq"), nb::arg("tk"), nb::arg("h_size"), nb::arg("w_size"),
+          nb::arg("num_heads"), nb::arg("kv_heads"), nb::arg("head_dim"),
+          nb::arg("kh"), nb::arg("kw"), nb::arg("temporal_window"), nb::arg("clamp"),
+          nb::arg("scale"), nb::arg("dtype_code"), nb::arg("stream_ptr"));
+
     m.def("gated_delta_decode_fused", &gated_delta_decode_fused,
           "GatedDeltaNet decode with gate projections, gate math and q/k normalization folded in",
           nb::arg("mixed_qkv"), nb::arg("x"), nb::arg("w_a"), nb::arg("w_b"), nb::arg("dt_bias"), nb::arg("g_decay"),
@@ -5371,6 +5442,10 @@ NB_MODULE(_C, m) {
           nb::arg("points"), nb::arg("n_points"), nb::arg("tris"), nb::arg("tri_index"), nb::arg("n_leaves"),
           nb::arg("child"), nb::arg("box"), nb::arg("max_dist"), nb::arg("dist"), nb::arg("closest"), nb::arg("face"),
           nb::arg("stream_ptr"));
+    m.def("closest_hit_on_mesh", &closest_hit_on_mesh, "Nearest ray hit on a BVH'd triangle mesh per ray",
+          nb::arg("origins"), nb::arg("directions"), nb::arg("n_rays"), nb::arg("tris"), nb::arg("tri_index"),
+          nb::arg("n_leaves"), nb::arg("child"), nb::arg("box"), nb::arg("tmin"), nb::arg("tmax"),
+          nb::arg("cull_backface"), nb::arg("t"), nb::arg("face"), nb::arg("stream_ptr"));
     m.def("connected_components", &connected_components, "Union-find connected components of an edge list",
           nb::arg("edges"), nb::arg("n_edges"), nb::arg("edges_int64"), nb::arg("n_nodes"), nb::arg("parent"),
           nb::arg("labels"), nb::arg("stream_ptr"));
