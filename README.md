@@ -48,6 +48,8 @@ implementations, packaging, and tests on which this work is built.
 
 The XPU development line includes upstream Comfy Kitchen `0.2.40` at
 [`f8b7e97a1418d2e529bd5405fbf86312be198ae6`](https://github.com/Comfy-Org/comfy-kitchen/commit/f8b7e97a1418d2e529bd5405fbf86312be198ae6).
+It also includes applicable upstream changes through
+[`7d6a22ae8281cd1053a8449530fa0e764a2e51cb`](https://github.com/Comfy-Org/comfy-kitchen/commit/7d6a22ae8281cd1053a8449530fa0e764a2e51cb).
 The Intel-specific work in this fork is intentionally optional: importing
 Comfy Kitchen remains safe when PyTorch XPU, `omni_xpu_kernel`, its native
 extension, or Intel GPU hardware is absent.
@@ -86,7 +88,7 @@ available in the installed companion wheel.
 ## XPU support matrix
 
 This matrix follows the [upstream per-function format](https://github.com/Comfy-Org/comfy-kitchen#backend-capabilities-matrix)
-for the fork's `0.2.40` API and matching `omni_xpu_kernel` companion package.
+for the fork's `0.2.41` API and matching `omni_xpu_kernel` companion package.
 ✓ means the fork has a native XPU route when the matching companion symbol is
 present; an empty cell means it does not. Triton or PyTorch eager fallbacks do
 not count as XPU backend support. A ✓ may still have dtype, shape, layout, or
@@ -274,7 +276,7 @@ git clone https://github.com/xiangyuT/comfy-kitchen-xpu.git
 cd comfy-kitchen-xpu
 python -m pip install build
 python -m build --wheel
-pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.40-py3-none-any.whl
+pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.41-py3-none-any.whl
 ```
 
 The repository retains upstream CUDA source to keep future upstream updates
